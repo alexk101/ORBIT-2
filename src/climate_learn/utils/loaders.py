@@ -2,6 +2,7 @@
 
 from typing import Any, Callable, Dict, Iterable, Optional, Union
 from functools import partial
+import math
 import warnings
 
 # Local application
@@ -256,7 +257,25 @@ load_downscaling_module = partial(
 )
 
 
-def load_architecture(task, data_module, architecture, default_vars, superres_mag=4,cnn_ratio=4, patch_size=2,embed_dim=256,depth=6,decoder_depth=1,num_heads=4,mlp_ratio=4,drop_path=0.1,drop_rate=0.1, tensor_par_size = 1, tensor_par_group = None,FusedAttn_option = FusedAttn.CK ):
+def load_architecture(
+    task, 
+    data_module, 
+    architecture, 
+    default_vars, 
+    superres_mag=4,
+    cnn_ratio=4,
+    patch_size=2,
+    embed_dim=256,
+    depth=6,
+    decoder_depth=1,
+    num_heads=4,
+    mlp_ratio=4,
+    drop_path=0.1,
+    drop_rate=0.1, 
+    tensor_par_size = 1, 
+    tensor_par_group = None,
+    FusedAttn_option = FusedAttn.CK 
+):
     in_vars, out_vars = get_data_variables(data_module)
     in_shape, out_shape = get_data_dims(data_module)
 
@@ -424,6 +443,20 @@ def load_lr_scheduler(
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, **sched_kwargs
         )
+    elif sched == "cosine-annealing-test":
+        max_epochs = int(sched_kwargs["max_epochs"])
+        warmup_epochs = int(sched_kwargs["warmup_epochs"])
+        if max_epochs < 1:
+            raise ValueError("max_epochs must be >= 1 for cosine-annealing-test")
+
+        def lr_scale(x: int) -> float:
+            cos_scale = 0.5 * (1 + math.cos(math.pi * x / max_epochs))
+            if warmup_epochs <= 0:
+                return cos_scale
+            lin_scale = (x + 1) / warmup_epochs
+            return min(lin_scale, cos_scale)
+
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
     else:
         raise NotImplementedError(
             f"{sched} is not an implemented learning rate scheduler. If you"
