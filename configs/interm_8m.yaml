@@ -4,7 +4,7 @@ trainer:
   checkpoint: 
   pretrain:
   batch_size: 32
-  buffer_size: 400
+  buffer_size: 300
   num_workers: 2
   data_type: bfloat16
   gpu_type: "amd" #amd or nvidia
