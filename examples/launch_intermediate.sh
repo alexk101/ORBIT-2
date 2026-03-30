@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A GEO163
 #SBATCH -J flash
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --gres=gpu:8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7

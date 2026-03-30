@@ -815,12 +815,12 @@ def run_training_epochs(
             )
             epoch_loss += loss.detach()
 
-            if world_rank < tensor_par_size:
-                print(
-                    f"epoch: {epoch}, batch_idx: {batch_idx}, "
-                    f"world_rank: {world_rank}, loss: {loss}",
-                    flush=True,
-                )
+            # if world_rank < tensor_par_size:
+            #     print(
+            #         f"epoch: {epoch}, batch_idx: {batch_idx}, "
+            #         f"world_rank: {world_rank}, loss: {loss}",
+            #         flush=True,
+            #     )
 
             optimizer.zero_grad()
 
@@ -850,11 +850,11 @@ def run_training_epochs(
             train_monitor["interval_loss_sum"] += float(loss.detach().item())
             train_monitor["interval_steps"] += 1
 
-            log_gpu_memory(
-                device,
-                f"batch_idx {batch_idx} get_last_lr {scheduler.get_last_lr()} after scheduler step",
-                world_rank,
-            )
+            # log_gpu_memory(
+            #     device,
+            #     f"batch_idx {batch_idx} get_last_lr {scheduler.get_last_lr()} after scheduler step",
+            #     world_rank,
+            # )
 
             if world_rank == 0:
                 torch.cuda.synchronize(device=device)
