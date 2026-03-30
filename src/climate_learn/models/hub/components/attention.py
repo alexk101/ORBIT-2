@@ -2,12 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Type
-from climate_learn.utils.dist_functions import F_Identity_B_AllReduce, F_Identity_B_AllReduce_VariableMapping, Grad_Inspect
+from climate_learn.utils.dist_functions import F_Identity_B_AllReduce, F_Identity_B_AllReduce_VariableMapping
 from climate_learn.utils.fused_attn import FusedAttn
 import torch.distributed as dist
 
 import xformers
-from xformers.components.attention.core import scaled_dot_product_attention as xformers_sdpa
 
 class Attention(nn.Module):
     def __init__(

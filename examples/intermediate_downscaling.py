@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 import functools
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -398,13 +399,25 @@ def _grad_norm_after_backward(model, scaler, optimizer, data_type: str) -> float
 
 
 def _weight_norm_l2(model) -> float:
-    """Global L2 norm of all parameters (FSDP-aware via summon_full_params)."""
+    """Global L2 norm of all parameters.
+
+    For sharded FSDP (``FULL_SHARD``, ``HYBRID_SHARD``), each rank sums squares of
+    its local parameter shards and we ``all_reduce``(SUM); no ``summon_full_params``.
+    For replicated params (``NO_SHARD``, ``SHARD_GRAD_OP``), the local sum is already
+    the global norm, so we do not reduce across ranks.
+    """
     if isinstance(model, FSDP):
-        with FSDP.summon_full_params(model, writeback=False, rank0_only=False):
-            sq = torch.zeros(1, device=next(model.parameters()).device, dtype=torch.float32)
-            for p in model.parameters():
-                sq += p.detach().float().pow(2).sum()
-            return float(torch.sqrt(sq).item())
+        device = torch.device("cuda", torch.cuda.current_device())
+        sq = torch.zeros(1, device=device, dtype=torch.float64)
+        for p in model.parameters():
+            sq += p.detach().to(dtype=torch.float64).pow(2).sum()
+        strat = model.sharding_strategy
+        if dist.is_initialized() and strat in (
+            ShardingStrategy.FULL_SHARD,
+            ShardingStrategy.HYBRID_SHARD,
+        ):
+            dist.all_reduce(sq, op=dist.ReduceOp.SUM)
+        return float(torch.sqrt(sq).item())
     sq = torch.zeros(1, device=next(model.parameters()).device, dtype=torch.float32)
     for p in model.parameters():
         sq += p.detach().float().pow(2).sum()
@@ -431,8 +444,13 @@ def run_validation_average_loss(
     device,
     val_losses,
     val_transforms,
+    max_batches: Optional[int] = None,
 ) -> float:
-    """Mean primary validation loss over the loader, reduced across ranks."""
+    """Mean primary validation loss over the loader, reduced across ranks.
+
+    If ``max_batches`` is set, only the first that many batches per rank are used
+    (cheap interval metrics; full val should use ``max_batches=None``).
+    """
     if not val_losses:
         return float("nan")
     model.eval()
@@ -441,6 +459,8 @@ def run_validation_average_loss(
     local_n = torch.zeros(1, device=device, dtype=torch.float64)
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
             loss_dict = evaluate_func(
                 batch, "val", model, int(device), val_losses, val_transforms
             )
@@ -734,6 +754,8 @@ def run_training_epochs(
     log_every_n_steps,
     wandb_run,
     data_key,
+    interval_val_max_batches: Optional[int] = None,
+    log_weight_norm: bool = True,
 ):
     """Run training loop for specified epoch range.
     
@@ -754,7 +776,9 @@ def run_training_epochs(
         min_scale (float): Minimum scale value for GradScaler (None for float32)
         cp_save_path (str): Path for saving checkpoints
         local_rank (int): Local rank for current process
-        
+        interval_val_max_batches: Max val batches per rank when logging interval metrics (None = all).
+        log_weight_norm: If False, skip weight L2 (avoids FSDP full-param materialization).
+
     Returns:
         int: Final epoch number
     """
@@ -832,13 +856,16 @@ def run_training_epochs(
                 train_monitor["interval_loss_sum"] = 0.0
                 train_monitor["interval_steps"] = 0
 
-                weight_norm = _weight_norm_l2(model)
+                weight_norm = (
+                    _weight_norm_l2(model) if log_weight_norm else float("nan")
+                )
                 val_loss = run_validation_average_loss(
                     model,
                     val_dataloader,
                     device,
                     val_losses,
                     val_transforms,
+                    max_batches=interval_val_max_batches,
                 )
                 lrs = scheduler.get_last_lr()
                 lr0 = float(lrs[0]) if lrs else 0.0
@@ -1232,6 +1259,11 @@ def main(device):
         log_every_n_steps = int(wandb_conf.get("log_every_n_steps", 0) or 0)
     if wandb_enabled and log_every_n_steps <= 0:
         log_every_n_steps = 500
+
+    ivmb_raw = conf["trainer"].get("interval_val_max_batches")
+    interval_val_max_batches = int(ivmb_raw) if ivmb_raw is not None else None
+    log_weight_norm = bool(conf["trainer"].get("log_weight_norm", True))
+
     wandb_project = wandb_conf.get("project", "ORBIT-2")
     wandb_entity = wandb_conf.get("entity") or None
     wandb_run_name = wandb_conf.get("run_name") or None
@@ -1251,11 +1283,15 @@ def main(device):
                     "batch_size": batch_size,
                     "lr": lr,
                     "log_every_n_steps": log_every_n_steps,
+                    "interval_val_max_batches": interval_val_max_batches,
+                    "log_weight_norm": log_weight_norm,
                 },
             )
     dist_print(
         f"Interval metrics: log_every_n_steps={log_every_n_steps}, "
-        f"wandb_enabled={wandb_enabled}"
+        f"wandb_enabled={wandb_enabled}, "
+        f"interval_val_max_batches={interval_val_max_batches}, "
+        f"log_weight_norm={log_weight_norm}"
     )
 
     if data_type == "bfloat16":
@@ -1629,6 +1665,8 @@ def main(device):
                 log_every_n_steps=log_every_n_steps,
                 wandb_run=wandb_run,
                 data_key=data_key,
+                interval_val_max_batches=interval_val_max_batches,
+                log_weight_norm=log_weight_norm,
             )
 
             if first_time_bool:

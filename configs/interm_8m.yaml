@@ -11,6 +11,10 @@ trainer:
   train_loss: "bayesian_tv"
   # Optimizer steps between aligned train+val metrics (0 = disabled). Also used when wandb.enabled.
   log_every_n_steps: 100
+  # Cap val batches per rank on each log (reduces RAM/CPU vs full val every N steps). Omit/null = full val.
+  interval_val_max_batches: 64
+  # FSDP: full weight norm used rank0_only=True; set false to skip entirely.
+  log_weight_norm: true
   # Step-based LR scheduler options for A/B runs.
   lr_scheduler: "warmup-cosine"  # or: "warmup-linear-sqrt-cooldown"
   scheduler_max_steps: 20000
