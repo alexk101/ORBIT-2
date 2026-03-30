@@ -15,16 +15,10 @@
 
 
 #ulimit -n 65536
-
-
-
-source ~/miniconda3/etc/profile.d/conda.sh
-
-
+module load miniforge3/23.11.0-0
 module load PrgEnv-gnu
 module load rocm/6.4.2
 module load craype-accel-amd-gfx90a
-
 
 source activate /lustre/orion/geo163/world-shared/python-envs/torch-2.9.1-rocm-6.4.2
 
