@@ -15,7 +15,11 @@ from ..models.hub import (
     VisionTransformer,
     Res_Slim_ViT,
 )
-from ..models.lr_scheduler import LinearWarmupCosineAnnealingLR
+from ..models.lr_scheduler import (
+    LinearWarmupCosineAnnealingLR,
+    LinearWarmupCosineAnnealingLRSteps,
+    LinearWarmupLinearSqrtCooldownLRSteps,
+)
 from ..transforms import TRANSFORMS_REGISTRY
 from ..metrics import MetricsMetaInfo, METRICS_REGISTRY
 
@@ -437,6 +441,12 @@ def load_lr_scheduler(
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, **sched_kwargs)
     elif sched == "linear-warmup-cosine-annealing":
         lr_scheduler = LinearWarmupCosineAnnealingLR(optimizer, **sched_kwargs)
+    elif sched == "linear-warmup-cosine-annealing-steps":
+        lr_scheduler = LinearWarmupCosineAnnealingLRSteps(optimizer, **sched_kwargs)
+    elif sched == "linear-warmup-linear-sqrt-cooldown-steps":
+        lr_scheduler = LinearWarmupLinearSqrtCooldownLRSteps(
+            optimizer, **sched_kwargs
+        )
     elif sched == "reduce-lr-on-plateau":
         lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, **sched_kwargs

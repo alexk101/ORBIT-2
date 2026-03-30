@@ -540,23 +540,83 @@ def create_model_and_optimizer(
         {"lr": lr, "weight_decay": weight_decay, "betas": (beta_1, beta_2)},
     )
 
-    # Extract scheduler configuration
+    # Extract scheduler configuration (step-based; aligns with per-step scheduler.step())
+    lr_scheduler_kind = str(
+        config["trainer"].get("lr_scheduler", "warmup-cosine")
+    ).lower()
     warmup_epochs = config["model"]["warmup_epochs"]
     warmup_start_lr = float(config["model"]["warmup_start_lr"])
     eta_min = float(config["model"]["eta_min"])
     max_epochs = config["trainer"]["max_epochs"]
 
-    # Create scheduler
-    scheduler = cl.load_lr_scheduler(
-        "linear-warmup-cosine-annealing",
-        optimizer,
-        {
-            "warmup_epochs": warmup_epochs,
-            "max_epochs": max_epochs,
-            "warmup_start_lr": warmup_start_lr,
-            "eta_min": eta_min,
-        },
+    spe_cfg = config["trainer"].get("steps_per_epoch")
+    if spe_cfg is not None:
+        steps_per_epoch = int(spe_cfg)
+    else:
+        train_dataloader = data_module.train_dataloader()
+        try:
+            steps_per_epoch = len(train_dataloader)
+        except TypeError as e:
+            raise TypeError(
+                "train_dataloader has no len(); set trainer.steps_per_epoch in config."
+            ) from e
+
+    max_train_steps_cfg = config["trainer"].get("scheduler_max_steps")
+    max_train_steps = (
+        int(max_train_steps_cfg)
+        if max_train_steps_cfg is not None
+        else int(max_epochs * steps_per_epoch)
     )
+    warmup_steps_cfg = config["trainer"].get("scheduler_warmup_steps")
+    warmup_steps = (
+        int(warmup_steps_cfg)
+        if warmup_steps_cfg is not None
+        else int(warmup_epochs * steps_per_epoch)
+    )
+
+    if lr_scheduler_kind == "warmup-cosine":
+        scheduler = cl.load_lr_scheduler(
+            "linear-warmup-cosine-annealing-steps",
+            optimizer,
+            {
+                "warmup_steps": warmup_steps,
+                "max_steps": max_train_steps,
+                "warmup_start_lr": warmup_start_lr,
+                "eta_min": eta_min,
+            },
+        )
+    elif lr_scheduler_kind == "warmup-linear-sqrt-cooldown":
+        cooldown_start_step_cfg = config["trainer"].get("scheduler_cooldown_start_step")
+        cooldown_fraction = float(
+            config["trainer"].get("scheduler_cooldown_fraction", 0.1)
+        )
+        if cooldown_start_step_cfg is not None:
+            cooldown_start_step = int(cooldown_start_step_cfg)
+        else:
+            cooldown_start_step = int(max_train_steps * (1.0 - cooldown_fraction))
+        cooldown_start_factor = float(
+            config["trainer"].get("scheduler_cooldown_start_factor", 0.1)
+        )
+
+        scheduler = cl.load_lr_scheduler(
+            "linear-warmup-linear-sqrt-cooldown-steps",
+            optimizer,
+            {
+                "warmup_steps": warmup_steps,
+                "max_steps": max_train_steps,
+                "cooldown_start_step": cooldown_start_step,
+                "cooldown_start_factor": cooldown_start_factor,
+                "warmup_start_lr": warmup_start_lr,
+            },
+        )
+    else:
+        raise ValueError(
+            "trainer.lr_scheduler must be one of: "
+            "warmup-cosine, warmup-linear-sqrt-cooldown"
+        )
+    if warmup_steps > 0:
+        for group in optimizer.param_groups:
+            group["lr"] = warmup_start_lr
 
     return model, optimizer, scheduler, train_loss, val_losses
 
@@ -735,13 +795,15 @@ def run_training_epochs(
                 if scaler._scale < min_scale:
                     scaler._scale = torch.tensor(min_scale).to(scaler._scale)
 
+            scheduler.step()
+
             train_monitor["global_step"] += 1
             train_monitor["interval_loss_sum"] += float(loss.detach().item())
             train_monitor["interval_steps"] += 1
 
             log_gpu_memory(
                 device,
-                f"batch_idx {batch_idx} get_lr {scheduler.get_lr()} after optimizer step",
+                f"batch_idx {batch_idx} get_last_lr {scheduler.get_last_lr()} after scheduler step",
                 world_rank,
             )
 
@@ -799,8 +861,6 @@ def run_training_epochs(
                         step=train_monitor["global_step"],
                     )
                 dist.barrier(device_ids=[local_rank])
-
-        scheduler.step()
 
         dist_print(f"Epoch {epoch} completed. Loss: {epoch_loss.item()}")
 
@@ -1155,6 +1215,8 @@ def main(device):
         "interval_steps": 0,
     }
 
+    resume_scheduler_state_dict = None
+
     wandb_conf = conf["trainer"].get("wandb") or {}
     wandb_enabled = bool(wandb_conf.get("enabled", False))
     log_every_n_steps = int(conf["trainer"].get("log_every_n_steps", 0) or 0)
@@ -1392,17 +1454,6 @@ def main(device):
                     {"lr": lr, "weight_decay": weight_decay, "betas": (beta_1, beta_2)},
                 )
 
-                scheduler = cl.load_lr_scheduler(
-                    "linear-warmup-cosine-annealing",
-                    optimizer,
-                    {
-                        "warmup_epochs": warmup_epochs,
-                        "max_epochs": max_epochs,
-                        "warmup_start_lr": warmup_start_lr,
-                        "eta_min": eta_min,
-                    },
-                )
-
                 if checkpoint_path is not None:
 
                     dist_print(
@@ -1420,13 +1471,13 @@ def main(device):
 
                     checkpoint = torch.load(checkpoint_path, map_location=map_location)
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
                     epoch_start = checkpoint["epoch"] + 1
                     train_monitor["global_step"] = int(
                         checkpoint.get("global_step", 0)
                     )
                     train_monitor["interval_loss_sum"] = 0.0
                     train_monitor["interval_steps"] = 0
+                    resume_scheduler_state_dict = checkpoint["scheduler_state_dict"]
                     del checkpoint
 
             # get latitude and longitude
@@ -1437,6 +1488,103 @@ def main(device):
 
             # get validation data loader
             val_dataloader = data_module.val_dataloader()
+
+            if first_time_bool:
+                lr_scheduler_kind = str(
+                    conf["trainer"].get("lr_scheduler", "warmup-cosine")
+                ).lower()
+                spe_cfg = conf["trainer"].get("steps_per_epoch")
+                if spe_cfg is not None:
+                    steps_per_epoch = int(spe_cfg)
+                else:
+                    try:
+                        steps_per_epoch = len(train_dataloader)
+                    except TypeError as e:
+                        raise TypeError(
+                            "train_dataloader has no len(); set trainer.steps_per_epoch "
+                            "in the config for step-based LR scheduling."
+                        ) from e
+
+                max_train_steps_cfg = conf["trainer"].get("scheduler_max_steps")
+                if max_train_steps_cfg is not None:
+                    max_train_steps = int(max_train_steps_cfg)
+                else:
+                    max_train_steps = int(max_epochs * steps_per_epoch)
+
+                warmup_steps_cfg = conf["trainer"].get("scheduler_warmup_steps")
+                if warmup_steps_cfg is not None:
+                    warmup_steps = int(warmup_steps_cfg)
+                else:
+                    warmup_steps = int(warmup_epochs * steps_per_epoch)
+
+                dist_print(
+                    "LR schedule kind=",
+                    lr_scheduler_kind,
+                    "warmup_steps=",
+                    warmup_steps,
+                    "max_steps=",
+                    max_train_steps,
+                    "steps_per_epoch=",
+                    steps_per_epoch,
+                )
+
+                if lr_scheduler_kind == "warmup-cosine":
+                    scheduler = cl.load_lr_scheduler(
+                        "linear-warmup-cosine-annealing-steps",
+                        optimizer,
+                        {
+                            "warmup_steps": warmup_steps,
+                            "max_steps": max_train_steps,
+                            "warmup_start_lr": warmup_start_lr,
+                            "eta_min": eta_min,
+                        },
+                    )
+                elif lr_scheduler_kind == "warmup-linear-sqrt-cooldown":
+                    cooldown_start_step_cfg = conf["trainer"].get(
+                        "scheduler_cooldown_start_step"
+                    )
+                    cooldown_fraction = float(
+                        conf["trainer"].get("scheduler_cooldown_fraction", 0.1)
+                    )
+                    if cooldown_start_step_cfg is not None:
+                        cooldown_start_step = int(cooldown_start_step_cfg)
+                    else:
+                        cooldown_start_step = int(
+                            max_train_steps * (1.0 - cooldown_fraction)
+                        )
+                    cooldown_start_factor = float(
+                        conf["trainer"].get("scheduler_cooldown_start_factor", 0.1)
+                    )
+
+                    dist_print(
+                        "cooldown_start_step=",
+                        cooldown_start_step,
+                        "cooldown_start_factor=",
+                        cooldown_start_factor,
+                    )
+                    scheduler = cl.load_lr_scheduler(
+                        "linear-warmup-linear-sqrt-cooldown-steps",
+                        optimizer,
+                        {
+                            "warmup_steps": warmup_steps,
+                            "max_steps": max_train_steps,
+                            "cooldown_start_step": cooldown_start_step,
+                            "cooldown_start_factor": cooldown_start_factor,
+                            "warmup_start_lr": warmup_start_lr,
+                        },
+                    )
+                else:
+                    raise ValueError(
+                        "trainer.lr_scheduler must be one of: "
+                        "warmup-cosine, warmup-linear-sqrt-cooldown"
+                    )
+
+                if resume_scheduler_state_dict is not None:
+                    scheduler.load_state_dict(resume_scheduler_state_dict)
+                    resume_scheduler_state_dict = None
+                elif warmup_steps > 0:
+                    for group in optimizer.param_groups:
+                        group["lr"] = warmup_start_lr
 
             # perform training
 

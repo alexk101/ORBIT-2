@@ -50,19 +50,19 @@ def load_checkpoint(model, checkpoint_path, device, world_rank=0):
     dist_print("Checkpoint loaded successfully")
 
 
-def load_training_state(optimizer, scheduler, checkpoint_path, world_rank=0):
-    """Load optimizer and scheduler state from checkpoint."""
+def load_training_state(optimizer, checkpoint_path, world_rank=0):
+    """Load optimizer state from checkpoint; return epoch and scheduler state dict."""
     dist_print(f"Loading training state from checkpoint: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     epoch_start = checkpoint["epoch"] + 1
+    sched_sd = checkpoint["scheduler_state_dict"]
     del checkpoint
 
     dist_print(f"Resuming from epoch {epoch_start}")
 
-    return epoch_start
+    return epoch_start, sched_sd
 
 
 def load_pretrained_weights(model, pretrained_path, device, world_rank=0):
@@ -456,12 +456,20 @@ def main(device):
         model, "adamw", {"lr": 5e-5, "weight_decay": 1e-5, "betas": (0.9, 0.99)}
     )
 
+    # Get data loaders (needed for step-based schedule length)
+    train_dataloader = data_module.train_dataloader()
+    val_dataloader = data_module.val_dataloader()
+
+    steps_per_epoch = len(train_dataloader)
+    warmup_steps = 2 * steps_per_epoch
+    max_train_steps = int(args.max_epochs * steps_per_epoch)
+
     scheduler = cl.load_lr_scheduler(
-        "linear-warmup-cosine-annealing",
+        "linear-warmup-cosine-annealing-steps",
         optimizer,
         {
-            "warmup_epochs": 2,
-            "max_epochs": args.max_epochs,
+            "warmup_steps": warmup_steps,
+            "max_steps": max_train_steps,
             "warmup_start_lr": 1e-7,
             "eta_min": 1e-7,
         },
@@ -469,14 +477,15 @@ def main(device):
 
     # Resume from checkpoint if specified
     epoch_start = 0
+    resume_sched_sd = None
     if args.checkpoint is not None:
-        epoch_start = load_training_state(
-            optimizer, scheduler, args.checkpoint, world_rank
+        epoch_start, resume_sched_sd = load_training_state(
+            optimizer, args.checkpoint, world_rank
         )
-
-    # Get data loaders
-    train_dataloader = data_module.train_dataloader()
-    val_dataloader = data_module.val_dataloader()
+        scheduler.load_state_dict(resume_sched_sd)
+    elif warmup_steps > 0:
+        for group in optimizer.param_groups:
+            group["lr"] = 1e-7
 
     # Training loop
     for epoch in range(epoch_start, args.max_epochs):
@@ -508,11 +517,12 @@ def main(device):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             if batch_idx % 10 == 0:
                 gpu_mem = torch.cuda.memory_reserved(device) / (1024**3)
-                msg = f"batch_idx: {batch_idx}, world_rank: {world_rank}, lr: {scheduler.get_lr()}"
-                msg += f" after optimizer step torch.cuda.memory_reserved: {gpu_mem:.2f}GB"
+                msg = f"batch_idx: {batch_idx}, world_rank: {world_rank}, lr: {scheduler.get_last_lr()}"
+                msg += f" after scheduler step torch.cuda.memory_reserved: {gpu_mem:.2f}GB"
                 dist_print(msg)
 
 
@@ -522,8 +532,6 @@ def main(device):
                 dist_print(
                     f"Batch timing: {(tic4-tic1):0.4f} seconds (batch_idx={batch_idx})",
                 )
-
-        scheduler.step()
 
         if world_rank == 0:
             epoch_loss = epoch_loss / (batch_idx + 1)

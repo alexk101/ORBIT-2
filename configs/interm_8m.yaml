@@ -11,6 +11,16 @@ trainer:
   train_loss: "bayesian_tv"
   # Optimizer steps between aligned train+val metrics (0 = disabled). Also used when wandb.enabled.
   log_every_n_steps: 100
+  # Step-based LR scheduler options for A/B runs.
+  lr_scheduler: "warmup-cosine"  # or: "warmup-linear-sqrt-cooldown"
+  scheduler_max_steps: 20000
+  scheduler_warmup_steps: 500
+  # Used when train_dataloader has no __len__ or for fixed-step comparisons.
+  # steps_per_epoch: 500
+  # Cooldown scheduler options (defaults produce a 10% tail cooldown).
+  # scheduler_cooldown_fraction: 0.1
+  # scheduler_cooldown_start_step: 18000
+  # scheduler_cooldown_start_factor: 0.1
   wandb:
     enabled: true
     project: "ORBIT-2"
