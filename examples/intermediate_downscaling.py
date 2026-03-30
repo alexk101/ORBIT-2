@@ -1,5 +1,7 @@
 # Standard library
 import os
+from typing import Optional
+
 import torch
 import functools
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -18,6 +20,11 @@ import time
 import yaml
 
 # Third party
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 import climate_learn as cl
 from climate_learn.data.processing.era5_constants import (
     CONSTANTS,
@@ -356,6 +363,9 @@ def evaluate_func(batch, stage: str, net, device: int, loss_metrics, target_tran
         if transforms is not None and transforms[i] is not None:
             yhat_ = transforms[i](yhat)
             y_ = transforms[i](y)
+        else:
+            yhat_ = yhat
+            y_ = y
 
         if y_.size(dim=2) != yhat_.size(dim=2) or y_.size(dim=3) != yhat_.size(dim=3):
             losses = lf(yhat_, y_[:, :, 0 : yhat_.size(dim=2), 0 : yhat_.size(dim=3)])
@@ -371,6 +381,80 @@ def evaluate_func(batch, stage: str, net, device: int, loss_metrics, target_tran
                 loss_dict[name] = loss
             loss_dict[f"{stage}/{loss_name}:aggregate"] = losses[-1]
     return loss_dict
+
+
+def _grad_norm_after_backward(model, scaler, optimizer, data_type: str) -> float:
+    """Total gradient L2 norm; call after backward, before optimizer/scaler step."""
+    if data_type != "float32":
+        scaler.unscale_(optimizer)
+    if isinstance(model, FSDP):
+        total = model.clip_grad_norm_(float("inf"))
+    else:
+        total = torch.nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
+    if isinstance(total, torch.Tensor):
+        return float(total.item())
+    return float(total)
+
+
+def _weight_norm_l2(model) -> float:
+    """Global L2 norm of all parameters (FSDP-aware via summon_full_params)."""
+    if isinstance(model, FSDP):
+        with FSDP.summon_full_params(model, writeback=False, rank0_only=False):
+            sq = torch.zeros(1, device=next(model.parameters()).device, dtype=torch.float32)
+            for p in model.parameters():
+                sq += p.detach().float().pow(2).sum()
+            return float(torch.sqrt(sq).item())
+    sq = torch.zeros(1, device=next(model.parameters()).device, dtype=torch.float32)
+    for p in model.parameters():
+        sq += p.detach().float().pow(2).sum()
+    return float(torch.sqrt(sq).item())
+
+
+def _primary_scalar_from_val_dict(
+    loss_dict, stage: str, loss_fn
+) -> Optional[torch.Tensor]:
+    name = getattr(loss_fn, "name", "loss_0")
+    for suffix in (":aggregate", ":agggregate"):
+        k = f"{stage}/{name}{suffix}"
+        if k in loss_dict:
+            v = loss_dict[k]
+            if isinstance(v, torch.Tensor):
+                return v.detach().float()
+            return torch.tensor(float(v), dtype=torch.float32)
+    return None
+
+
+def run_validation_average_loss(
+    model,
+    val_dataloader,
+    device,
+    val_losses,
+    val_transforms,
+) -> float:
+    """Mean primary validation loss over the loader, reduced across ranks."""
+    if not val_losses:
+        return float("nan")
+    model.eval()
+    lf0 = val_losses[0]
+    local_sum = torch.zeros(1, device=device, dtype=torch.float64)
+    local_n = torch.zeros(1, device=device, dtype=torch.float64)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_dataloader):
+            loss_dict = evaluate_func(
+                batch, "val", model, int(device), val_losses, val_transforms
+            )
+            v = _primary_scalar_from_val_dict(loss_dict, "val", lf0)
+            if v is None:
+                continue
+            v = v.to(device=device, dtype=torch.float64)
+            local_sum += v
+            local_n += 1.0
+    model.train()
+    dist.all_reduce(local_sum, op=dist.ReduceOp.SUM)
+    dist.all_reduce(local_n, op=dist.ReduceOp.SUM)
+    if local_n.item() <= 0:
+        return float("nan")
+    return float((local_sum / local_n).item())
 
 
 def setup_environment(local_rank):
@@ -564,6 +648,9 @@ def run_training_epochs(
     scheduler,
     scaler,
     train_dataloader,
+    val_dataloader,
+    val_losses,
+    val_transforms,
     epoch_start,
     epoch_end,
     data_type,
@@ -575,6 +662,10 @@ def run_training_epochs(
     min_scale,
     cp_save_path,
     local_rank,
+    train_monitor,
+    log_every_n_steps,
+    wandb_run,
+    data_key,
 ):
     """Run training loop for specified epoch range.
     
@@ -626,13 +717,27 @@ def run_training_epochs(
 
             if data_type == "float32":
                 loss.backward()
-                optimizer.step()
             else:
                 scaler.scale(loss).backward()
+
+            grad_norm_val = None
+            next_gs = train_monitor["global_step"] + 1
+            if log_every_n_steps and next_gs % log_every_n_steps == 0:
+                grad_norm_val = _grad_norm_after_backward(
+                    model, scaler, optimizer, data_type
+                )
+
+            if data_type == "float32":
+                optimizer.step()
+            else:
                 scaler.step(optimizer)
                 scaler.update()
                 if scaler._scale < min_scale:
                     scaler._scale = torch.tensor(min_scale).to(scaler._scale)
+
+            train_monitor["global_step"] += 1
+            train_monitor["interval_loss_sum"] += float(loss.detach().item())
+            train_monitor["interval_steps"] += 1
 
             log_gpu_memory(
                 device,
@@ -645,6 +750,55 @@ def run_training_epochs(
                 tic4 = time.perf_counter()
                 if batch_idx % 10 == 0:
                     dist_print(f"Batch {batch_idx}: {(tic4-tic1):0.4f} seconds")
+
+            if (
+                log_every_n_steps
+                and train_monitor["global_step"] % log_every_n_steps == 0
+            ):
+                interval_steps = train_monitor["interval_steps"]
+                avg_train = train_monitor["interval_loss_sum"] / max(
+                    1, interval_steps
+                )
+                train_monitor["interval_loss_sum"] = 0.0
+                train_monitor["interval_steps"] = 0
+
+                weight_norm = _weight_norm_l2(model)
+                val_loss = run_validation_average_loss(
+                    model,
+                    val_dataloader,
+                    device,
+                    val_losses,
+                    val_transforms,
+                )
+                lrs = scheduler.get_last_lr()
+                lr0 = float(lrs[0]) if lrs else 0.0
+                gnorm = (
+                    float(grad_norm_val)
+                    if grad_norm_val is not None
+                    else float("nan")
+                )
+
+                if world_rank == 0:
+                    dist_print(
+                        f"[interval step {train_monitor['global_step']}] "
+                        f"data_key={data_key} "
+                        f"train_loss={avg_train:.6g} val_loss={val_loss:.6g} "
+                        f"lr={lr0:.6g} grad_norm={gnorm} "
+                        f"weight_norm={weight_norm:.6g}"
+                    )
+                if wandb_run is not None and world_rank == 0:
+                    wandb.log(
+                        {
+                            "train/loss": avg_train,
+                            "val/loss": val_loss,
+                            "train/lr": lr0,
+                            "train/grad_norm": gnorm,
+                            "train/weight_norm": weight_norm,
+                            "epoch": epoch,
+                        },
+                        step=train_monitor["global_step"],
+                    )
+                dist.barrier(device_ids=[local_rank])
 
         scheduler.step()
 
@@ -660,6 +814,7 @@ def run_training_epochs(
             local_rank,
             tensor_par_size,
             device,
+            global_step=train_monitor["global_step"],
         )
 
     return epoch_end
@@ -675,6 +830,7 @@ def save_checkpoint(
     local_rank,
     tensor_par_size,
     device,
+    global_step=0,
 ):
     """
     Save model checkpoint to disk.
@@ -712,6 +868,7 @@ def save_checkpoint(
 
         checkpoint_dict = {
             "epoch": epoch,
+            "global_step": global_step,
             "model_state_dict": model_states,
             "optimizer_state_dict": optimizer_states,
             "scheduler_state_dict": scheduler_states,
@@ -992,6 +1149,45 @@ def main(device):
 
     cp_save_path = "checkpoints/climate"
 
+    train_monitor = {
+        "global_step": 0,
+        "interval_loss_sum": 0.0,
+        "interval_steps": 0,
+    }
+
+    wandb_conf = conf["trainer"].get("wandb") or {}
+    wandb_enabled = bool(wandb_conf.get("enabled", False))
+    log_every_n_steps = int(conf["trainer"].get("log_every_n_steps", 0) or 0)
+    if log_every_n_steps <= 0:
+        log_every_n_steps = int(wandb_conf.get("log_every_n_steps", 0) or 0)
+    if wandb_enabled and log_every_n_steps <= 0:
+        log_every_n_steps = 500
+    wandb_project = wandb_conf.get("project", "ORBIT-2")
+    wandb_entity = wandb_conf.get("entity") or None
+    wandb_run_name = wandb_conf.get("run_name") or None
+
+    wandb_run = None
+    if wandb_enabled:
+        if wandb is None:
+            sys.exit("trainer.wandb.enabled is true but wandb is not installed.")
+        if world_rank == 0:
+            wandb_run = wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                name=wandb_run_name,
+                config={
+                    "yaml": config_path,
+                    "preset": preset,
+                    "batch_size": batch_size,
+                    "lr": lr,
+                    "log_every_n_steps": log_every_n_steps,
+                },
+            )
+    dist_print(
+        f"Interval metrics: log_every_n_steps={log_every_n_steps}, "
+        f"wandb_enabled={wandb_enabled}"
+    )
+
     if data_type == "bfloat16":
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale = 128
@@ -1226,6 +1422,11 @@ def main(device):
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
                     scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
                     epoch_start = checkpoint["epoch"] + 1
+                    train_monitor["global_step"] = int(
+                        checkpoint.get("global_step", 0)
+                    )
+                    train_monitor["interval_loss_sum"] = 0.0
+                    train_monitor["interval_steps"] = 0
                     del checkpoint
 
             # get latitude and longitude
@@ -1248,6 +1449,9 @@ def main(device):
                 scheduler=scheduler,
                 scaler=scaler,
                 train_dataloader=train_dataloader,
+                val_dataloader=val_dataloader,
+                val_losses=val_losses,
+                val_transforms=val_transforms,
                 epoch_start=epoch_start,
                 epoch_end=epoch_end,
                 data_type=data_type,
@@ -1259,10 +1463,17 @@ def main(device):
                 min_scale=min_scale,
                 cp_save_path=cp_save_path,
                 local_rank=local_rank,
+                train_monitor=train_monitor,
+                log_every_n_steps=log_every_n_steps,
+                wandb_run=wandb_run,
+                data_key=data_key,
             )
 
             if first_time_bool:
                 first_time_bool = False
+
+    if world_rank == 0 and wandb_run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":

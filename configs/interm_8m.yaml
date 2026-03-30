@@ -9,6 +9,13 @@ trainer:
   data_type: bfloat16
   gpu_type: "amd" #amd or nvidia
   train_loss: "bayesian_tv"
+  # Optimizer steps between aligned train+val metrics (0 = disabled). Also used when wandb.enabled.
+  log_every_n_steps: 100
+  wandb:
+    enabled: true
+    project: "ORBIT-2"
+    entity: "scaling-transformers"
+    run_name: "test"
 
 #----------  Parallelism -------------
 parallelism:
