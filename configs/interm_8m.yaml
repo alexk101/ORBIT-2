@@ -4,13 +4,13 @@ trainer:
   checkpoint: 
   pretrain:
   batch_size: 32
-  buffer_size: 300
-  num_workers: 2
+  buffer_size: 32
+  num_workers: 1
   data_type: bfloat16
   gpu_type: "amd" #amd or nvidia
   train_loss: "bayesian_tv"
   # Optimizer steps between aligned train+val metrics (0 = disabled). Also used when wandb.enabled.
-  log_every_n_steps: 100
+  log_every_n_steps: 200
   # Cap val batches per rank on each log (reduces RAM/CPU vs full val every N steps). Omit/null = full val.
   interval_val_max_batches: null
   # FSDP: full weight norm used rank0_only=True; set false to skip entirely.
@@ -29,7 +29,7 @@ trainer:
     enabled: true
     project: "ORBIT-2"
     entity: "scaling-transformers"
-    run_name: "test"
+    run_name: "cosine-anneal-20k"
 
 #----------  Parallelism -------------
 parallelism:
