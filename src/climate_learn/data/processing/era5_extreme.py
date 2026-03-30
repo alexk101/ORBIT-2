@@ -9,6 +9,8 @@ from ..dataset import MapDataset, MapDatasetArgs
 import torch
 import numpy as np
 
+from climate_learn.utils.logging import dist_print
+
 
 parser = ArgumentParser(description="Generates the masks for ERA5 Extreme.")
 parser.add_argument("source", help="The directory where the raw ERA5 data is stored.")
@@ -174,7 +176,7 @@ for file_list in file_list_by_years:
         }
         np.savez(new_file_name, **sharded_data)
 
-    print(
+    dist_print(
         air_temp_extreme_mask.sum(),
         air_temp.shape[0] * air_temp.shape[-1] * air_temp.shape[-2],
     )

@@ -1,4 +1,5 @@
 # Standard library
+import os
 import random
 from dataclasses import dataclass
 
@@ -192,7 +193,13 @@ class NpyReader(IterableDataset):
         for idx in range(iter_start, iter_end):
             path_inp = self.inp_file_list[idx]
             path_out = self.out_file_list[idx]
-            print(torch.distributed.get_rank(), "NpyReader:", path_inp)
+            if int(os.environ.get("ORBIT_DEBUG_DATA", "0")):
+                print(
+                    torch.distributed.get_rank(),
+                    "NpyReader:",
+                    path_inp,
+                    flush=True,
+                )
 
             inp_data = np.load(path_inp)
             if path_out == path_inp:

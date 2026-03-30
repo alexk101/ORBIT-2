@@ -6,15 +6,12 @@ import math
 import warnings
 
 # Local application
-from ..data import IterDataModule
-from ..models import MODEL_REGISTRY
 from ..models.hub import (
     Climatology,
     Interpolation,
     LinearRegression,
     Persistence,
     ResNet,
-    Unet,
     VisionTransformer,
     Res_Slim_ViT,
 )
@@ -27,6 +24,8 @@ import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
 from climate_learn.utils.fused_attn import FusedAttn, parse_fused_attn
+
+from .logging import dist_print
 
 
 def load_model_module(
@@ -53,11 +52,8 @@ def load_model_module(
 
 
 
-    if torch.distributed.get_rank()==0:
-        print("Inside load_model_module model_kwargs",model_kwargs,flush=True)
-        print("architecture is ",architecture,"model is",model,flush=True)
-
-
+    dist_print("Inside load_model_module model_kwargs", model_kwargs)
+    dist_print("architecture is ", architecture, "model is", model)
 
 
     if lat is None and lon is None:
@@ -66,7 +62,7 @@ def load_model_module(
     if architecture is None and model is None:
         raise RuntimeError("Please specify 'architecture' or 'model'")
     elif architecture and model is None:
-        print(f"Loading architecture: {architecture}")
+        dist_print(f"Loading architecture: {architecture}")
         model  = load_architecture(
             task, data_module, architecture, **model_kwargs
         )
@@ -76,7 +72,7 @@ def load_model_module(
             f"{model} is not an implemented model."
         )
     elif isinstance(model, nn.Module):
-        print("Reuse custom network")
+        dist_print("Reuse custom network")
     else:
         raise TypeError("'model' must be str or nn.Module")
 
@@ -84,12 +80,12 @@ def load_model_module(
     if architecture is None and optim is None:
         raise RuntimeError("Please specify 'architecture' or 'optim'")
     elif architecture and optim is None:
-        print("Dont do anything with optimizer")
+        dist_print("Dont do anything with optimizer")
     elif isinstance(optim, str):
         raise RuntimeError("optimzier cannot be string")
     elif isinstance(optim, torch.optim.Optimizer):
         optimizer = optim
-        print("return custom optimizer")
+        dist_print("return custom optimizer")
     else:
         raise TypeError("'optim' must be str or torch.optim.Optimizer")
     # Load the LR scheduler, if specified
@@ -97,14 +93,14 @@ def load_model_module(
         raise RuntimeError("please specify architectur or sched")
     elif architecture and sched is None:
         lr_scheduler = None
-        print("don't do anything with scheduler")
+        dist_print("don't do anything with scheduler")
     elif isinstance(sched, str):
         raise RuntimeError("scheduler cannot be string")
     elif isinstance(sched, LRScheduler) or isinstance(
         sched, torch.optim.lr_scheduler.ReduceLROnPlateau
     ):
         lr_scheduler = sched
-        print("Reuse custom learning rate scheduler")
+        dist_print("Reuse custom learning rate scheduler")
     else:
         raise TypeError(
             "'sched' must be str, None, or torch.optim.lr_scheduler._LRScheduler"
@@ -113,23 +109,23 @@ def load_model_module(
     in_vars, out_vars = get_data_variables(data_module)
     lat, lon = data_module.get_lat_lon()
     if isinstance(train_loss, str):
-        print(f"Loading training loss: {train_loss}")
+        dist_print(f"Loading training loss: {train_loss}")
         clim = get_climatology(data_module, "train")
         metainfo = MetricsMetaInfo(in_vars, out_vars, lat, lon, clim)
         train_loss = load_loss(device,model, train_loss, True, metainfo)
     elif isinstance(train_loss, Callable):
-        print("Using custom training loss")
+        dist_print("Using custom training loss")
     else:
         raise TypeError("'train_loss' must be str or Callable")
     # Load training transform
     if isinstance(train_target_transform, str):
-        print(f"Loading training transform: {train_target_transform}")
+        dist_print(f"Loading training transform: {train_target_transform}")
         train_transform = load_transform(train_target_transform, data_module)
     elif isinstance(train_target_transform, Callable):
-        print("Using custom training transform")
+        dist_print("Using custom training transform")
         train_transform = train_target_transform
     elif train_target_transform is None:
-        print("No train transform")
+        dist_print("No train transform")
         train_transform = train_target_transform
     else:
         raise TypeError("'train_target_transform' must be str, callable, or None")
@@ -141,10 +137,10 @@ def load_model_module(
         if isinstance(vl, str):
             clim = get_climatology(data_module, "val")
             metainfo = MetricsMetaInfo(in_vars, out_vars, lat, lon, clim)
-            print(f"Loading validation loss: {vl}")
+            dist_print(f"Loading validation loss: {vl}")
             val_losses.append(load_loss(device,model, vl, False, metainfo))
         elif isinstance(vl, Callable):
-            print("Using custom validation loss")
+            dist_print("Using custom validation loss")
             val_losses.append(vl)
         else:
             raise TypeError("each 'val_loss' must be str or Callable")
@@ -153,13 +149,13 @@ def load_model_module(
     if isinstance(val_target_transform, Iterable):
         for vt in val_target_transform:
             if isinstance(vt, str):
-                print(f"Loading validation transform: {vt}")
+                dist_print(f"Loading validation transform: {vt}")
                 val_transforms.append(load_transform(vt, data_module))
             elif isinstance(vt, Callable):
-                print("Using custom validation transform")
+                dist_print("Using custom validation transform")
                 val_transforms.append(vt)
             elif vt is None:
-                print("No validation transform")
+                dist_print("No validation transform")
                 val_transforms.append(None)
             else:
                 raise TypeError("each 'val_transform' must be str, Callable, or None")
@@ -178,10 +174,10 @@ def load_model_module(
         if isinstance(tl, str):
             clim = get_climatology(data_module, "test")
             metainfo = MetricsMetaInfo(in_vars, out_vars, lat, lon, clim)
-            print(f"Loading test loss: {tl}")
+            dist_print(f"Loading test loss: {tl}")
             test_losses.append(load_loss(device,model, tl, False, metainfo))
         elif isinstance(tl, Callable):
-            print("Using custom testing loss")
+            dist_print("Using custom testing loss")
             test_losses.append(tl)
         else:
             raise TypeError("each 'test_loss' must be str or Callable")
@@ -190,13 +186,13 @@ def load_model_module(
     if isinstance(test_target_transform, Iterable):
         for tt in test_target_transform:
             if isinstance(tt, str):
-                print(f"Loading test transform: {tt}")
+                dist_print(f"Loading test transform: {tt}")
                 test_transforms.append(load_transform(tt, data_module))
             elif isinstance(tt, Callable):
-                print("Using custom test transform")
+                dist_print("Using custom test transform")
                 test_transforms.append(tt)
             elif tt is None:
-                print("No test transform")
+                dist_print("No test transform")
                 test_transforms.append(None)
             else:
                 raise TypeError("each 'test_transform' must be str, Callable, or None")
@@ -334,9 +330,9 @@ def load_architecture(
         in_channels, in_height, in_width = in_shape[1:]
         out_channels, out_height, out_width = out_shape[1:]
 
-        print("in_channels",in_channels,"in_height",in_height,"in_width",in_width,flush=True)
+        dist_print("in_channels",in_channels,"in_height",in_height,"in_width",in_width,flush=True)
 
-        print("out_channels",out_channels,"out_height",out_height,"out_width",out_width,flush=True)
+        dist_print("out_channels",out_channels,"out_height",out_height,"out_width",out_width,flush=True)
 
 
         if architecture.lower() in (

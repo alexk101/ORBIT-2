@@ -8,14 +8,14 @@ import numpy as np
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-import pickle
 import torch.distributed as dist
-from datetime import datetime, timedelta
+
+from climate_learn.utils.logging import dist_print
 
 try:
     import pyddstore as dds
-except:
-    print("DDStore loading error!!")
+except Exception:
+    dist_print("DDStore loading error!! (pyddstore import failed)")
 
 import re
 import os

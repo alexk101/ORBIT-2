@@ -14,6 +14,8 @@ import torch
 import numpy as np
 import torch.distributed as dist
 
+from climate_learn.utils.logging import dist_print
+
 
 def seed_everything(seed):
     """Set random seeds for reproducibility across all libraries.
@@ -81,19 +83,18 @@ def init_par_groups(
     for i in range(data_par_size * seq_par_size):
         ranks = [j for j in range(i * tensor_par_size, (i + 1) * tensor_par_size)]
 
-        if world_rank == 0:
-            print(
-                "i ",
-                i,
-                " data_par_size ",
-                data_par_size,
-                " SEQ_PAR_SIZE ",
-                seq_par_size,
-                " TENSOR_PAR_SIZE ",
-                tensor_par_size,
-                " tensor_par_group ranks ",
-                ranks,
-            )
+        dist_print(
+            "i ",
+            i,
+            " data_par_size ",
+            data_par_size,
+            " SEQ_PAR_SIZE ",
+            seq_par_size,
+            " TENSOR_PAR_SIZE ",
+            tensor_par_size,
+            " tensor_par_group ranks ",
+            ranks,
+        )
 
         group = dist.new_group(ranks)
 
@@ -110,20 +111,18 @@ def init_par_groups(
                 for j in range(seq_par_size)
             ]
 
-            if world_rank == 0:
-                print(
-                    "i ",
-                    i,
-                    " data_par_size ",
-                    data_par_size,
-                    " SEQ_PAR_SIZE ",
-                    seq_par_size,
-                    " TENSOR_PAR_SIZE ",
-                    tensor_par_size,
-                    " seq_par_group ranks ",
-                    ranks,
-                    flush=True,
-                )
+            dist_print(
+                "i ",
+                i,
+                " data_par_size ",
+                data_par_size,
+                " SEQ_PAR_SIZE ",
+                seq_par_size,
+                " TENSOR_PAR_SIZE ",
+                tensor_par_size,
+                " seq_par_group ranks ",
+                ranks,
+            )
 
             group = dist.new_group(ranks)
 
@@ -144,19 +143,18 @@ def init_par_groups(
             fsdp_end_idx = (k + 1) * fsdp_size
             fsdp_ranks = ranks[fsdp_begin_idx:fsdp_end_idx]
 
-            if world_rank == 0:
-                print(
-                    "i ",
-                    i,
-                    " data_par_size ",
-                    data_par_size,
-                    " SEQ_PAR_SIZE ",
-                    seq_par_size,
-                    " TENSOR_PAR_SIZE ",
-                    tensor_par_size,
-                    " fsdp_ranks",
-                    fsdp_ranks,
-                )
+            dist_print(
+                "i ",
+                i,
+                " data_par_size ",
+                data_par_size,
+                " SEQ_PAR_SIZE ",
+                seq_par_size,
+                " TENSOR_PAR_SIZE ",
+                tensor_par_size,
+                " fsdp_ranks",
+                fsdp_ranks,
+            )
 
             group = dist.new_group(fsdp_ranks)
             if world_rank in fsdp_ranks:
@@ -167,26 +165,7 @@ def init_par_groups(
             simple_ddp_end_idx = len(ranks)
             simple_ddp_ranks = ranks[simple_ddp_begin_idx:simple_ddp_end_idx:fsdp_size]
 
-            if world_rank == 0:
-                print(
-                    "i ",
-                    i,
-                    " data_par_size ",
-                    data_par_size,
-                    " SEQ_PAR_SIZE ",
-                    seq_par_size,
-                    " TENSOR_PAR_SIZE ",
-                    tensor_par_size,
-                    " simple_ddp_ranks",
-                    simple_ddp_ranks,
-                )
-
-            group = dist.new_group(simple_ddp_ranks)
-            if world_rank in simple_ddp_ranks:
-                simple_ddp_group = group
-
-        if world_rank == 0:
-            print(
+            dist_print(
                 "i ",
                 i,
                 " data_par_size ",
@@ -195,9 +174,26 @@ def init_par_groups(
                 seq_par_size,
                 " TENSOR_PAR_SIZE ",
                 tensor_par_size,
-                " data_par_group ranks ",
-                ranks,
+                " simple_ddp_ranks",
+                simple_ddp_ranks,
             )
+
+            group = dist.new_group(simple_ddp_ranks)
+            if world_rank in simple_ddp_ranks:
+                simple_ddp_group = group
+
+        dist_print(
+            "i ",
+            i,
+            " data_par_size ",
+            data_par_size,
+            " SEQ_PAR_SIZE ",
+            seq_par_size,
+            " TENSOR_PAR_SIZE ",
+            tensor_par_size,
+            " data_par_group ranks ",
+            ranks,
+        )
         group = dist.new_group(ranks)
         if world_rank in ranks:
             data_par_group = group
@@ -208,19 +204,18 @@ def init_par_groups(
     for i in range(tensor_par_size):
         ranks = [i + tensor_par_size * j for j in range(data_par_size * seq_par_size)]
 
-        if world_rank == 0:
-            print(
-                "i ",
-                i,
-                " data_par_size ",
-                data_par_size,
-                " SEQ_PAR_SIZE ",
-                seq_par_size,
-                " TENSOR_PAR_SIZE ",
-                tensor_par_size,
-                " data_seq_ort_group ranks ",
-                ranks,
-            )
+        dist_print(
+            "i ",
+            i,
+            " data_par_size ",
+            data_par_size,
+            " SEQ_PAR_SIZE ",
+            seq_par_size,
+            " TENSOR_PAR_SIZE ",
+            tensor_par_size,
+            " data_seq_ort_group ranks ",
+            ranks,
+        )
         group = dist.new_group(ranks)
 
         if world_rank in ranks:
@@ -234,3 +229,10 @@ def init_par_groups(
         fsdp_group,
         simple_ddp_group,
     )
+
+
+def log_gpu_memory(device, message="", world_rank=None):
+    """Log GPU memory on global rank 0 only."""
+    memory_gb = torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024
+    prefix = f"rank {world_rank} " if world_rank is not None else ""
+    dist_print(f"{prefix}{message} torch.cuda.memory_reserved: {memory_gb:.2f}GB")

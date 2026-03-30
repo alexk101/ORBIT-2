@@ -24,6 +24,7 @@ from .processing.era5_constants import PRECIP_VARIABLES
 from .precipmodule import LogTransform
 
 from climate_learn.dist.distdataset import *
+from climate_learn.utils.logging import dist_print
 
 
 def calculate_tile_overlap(overlap):
@@ -261,7 +262,7 @@ class IterDataModule(torch.nn.Module):
     def setup(self, stage: Optional[str] = None):
         # load datasets only if they're not loaded already
         use_ddstore = int(os.environ.get("ORBIT_USE_DDSTORE", 0))
-        print("use_ddstore is :", use_ddstore, flush=True)
+        dist_print("use_ddstore is :", use_ddstore)
 
         if use_ddstore:
             self.data_train = IndividualDataIter(
@@ -418,7 +419,7 @@ class IterDataModule(torch.nn.Module):
             ## assume: a GPU is mapped by the local rank
             gpu_id = int(os.getenv("SLURM_LOCALID", "0"))
             os.environ["FABRIC_IFACE"] = f"hsn{gpu_id//2}"
-            print("FABRIC_IFACE:", os.environ["FABRIC_IFACE"])
+            dist_print("FABRIC_IFACE:", os.environ["FABRIC_IFACE"])
 
             data_group_size = self.data_par_size
             data_group_rank = dist.get_rank(group=self.data_par_group)

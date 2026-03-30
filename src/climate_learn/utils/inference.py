@@ -1,13 +1,12 @@
 import os
 import numpy as np
-from scipy.stats import rankdata
-from tqdm import tqdm
 from ..data.processing.era5_constants import VAR_TO_UNIT as ERA5_VAR_TO_UNIT
 from ..data.processing.cmip6_constants import VAR_TO_UNIT as CMIP6_VAR_TO_UNIT
+from .logging import dist_print
 
 
 def test_on_many_images_lighting(mm, dm, in_transform, out_transform, variable, src, outputdir, index=0):
-    print("Start Inference",flush=True)
+    dist_print("Start Inference")
 
     lat, lon = dm.get_lat_lon()
     extent = [lon.min(), lon.max(), lat.min(), lat.max()]
@@ -16,8 +15,8 @@ def test_on_many_images_lighting(mm, dm, in_transform, out_transform, variable, 
 
     history = dm.hparams.history
 
-    print("dm.hparams",dm.hparams,flush=True)
-    print("out_channel",out_channel,"history",history,flush=True)
+    dist_print("dm.hparams", dm.hparams)
+    dist_print("out_channel", out_channel, "history", history)
 
     if src == "era5":
         variable_with_units = f"{variable} ({ERA5_VAR_TO_UNIT[variable]})"
@@ -37,7 +36,8 @@ def test_on_many_images_lighting(mm, dm, in_transform, out_transform, variable, 
         xx = xx.to(mm.device)
         pred = mm.forward(xx)
 
-        if counter == 0: print(f"xx {xx.shape} Batch size: {batch_size}")
+        if counter == 0:
+            dist_print(f"xx {xx.shape} Batch size: {batch_size}")
         if dm.hparams.task == "downscaling":
             img = in_transform(xx)[:, in_channel].detach().cpu().numpy()
         else:
@@ -75,12 +75,12 @@ def test_on_many_images_lighting(mm, dm, in_transform, out_transform, variable, 
         np.save(os.path.join(outputdir, f'prediction_{str(counter).zfill(4)}.npy'), ppred)
 
         # Counter
-        print(f"Save image data {counter}...")
+        dist_print(f"Save image data {counter}...")
         counter += 1
         
 def test_on_many_images(mm, dm, in_transform, out_transform, variable, src, outputdir, device, index=0):
     """native_pytorch version """
-    print("Start Inference",flush=True)
+    dist_print("Start Inference")
 
     lat, lon = dm.get_lat_lon()
     extent = [lon.min(), lon.max(), lat.min(), lat.max()]
@@ -89,7 +89,7 @@ def test_on_many_images(mm, dm, in_transform, out_transform, variable, src, outp
 
     history = mm.history
 
-    print("out_channel",out_channel,"history",history,flush=True)
+    dist_print("out_channel", out_channel, "history", history)
 
     if src == "era5":
         variable_with_units = f"{variable} ({ERA5_VAR_TO_UNIT[variable]})"
@@ -109,7 +109,8 @@ def test_on_many_images(mm, dm, in_transform, out_transform, variable, src, outp
         xx = xx.to(device)
         pred = mm.forward(xx)
 
-        if counter == 0: print(f"xx {xx.shape} Batch size: {batch_size}")
+        if counter == 0:
+            dist_print(f"xx {xx.shape} Batch size: {batch_size}")
         if dm.task == "downscaling":
             img = in_transform(xx)[:, in_channel].detach().cpu().numpy()
         else:
@@ -147,5 +148,5 @@ def test_on_many_images(mm, dm, in_transform, out_transform, variable, src, outp
         np.save(os.path.join(outputdir, f'prediction_{str(counter).zfill(4)}.npy'), ppred)
 
         # Counter
-        print(f"Save image data {counter}...")
+        dist_print(f"Save image data {counter}...")
         counter += 1

@@ -1,4 +1,3 @@
-from .components.cnn_blocks import PeriodicConv2D
 from .components.pos_embed import get_2d_sincos_pos_embed
 from .utils import register
 import torch
@@ -9,12 +8,12 @@ import torch.distributed as dist
 # Third party
 from timm.models.vision_transformer import trunc_normal_
 from .components.attention import VariableMapping_Attention
-from einops import rearrange
 from .components.pos_embed import interpolate_pos_embed_on_the_fly
 from .components.patch_embed import PatchEmbed 
 from .components.vit_blocks import Block
-from climate_learn.utils.dist_functions import F_Identity_B_Broadcast, Grad_Inspect
+from climate_learn.utils.dist_functions import F_Identity_B_Broadcast
 from climate_learn.utils.fused_attn import FusedAttn
+from climate_learn.utils.logging import dist_print
 
 
 @register("res_slimvit")
@@ -156,12 +155,20 @@ class Res_Slim_ViT(nn.Module):
             self.num_patches = img_size[0] * img_size[1]// (self.patch_size **2)
        
  
-        if torch.distributed.get_rank()==0:
-            print("updated res is ",res,"img_size",img_size,"in_channels",in_channels,"out_channels",out_channels,"num_patches",self.num_patches,flush=True)
+        dist_print(
+            "updated res is ",
+            res,
+            "img_size",
+            img_size,
+            "in_channels",
+            in_channels,
+            "out_channels",
+            out_channels,
+            "num_patches",
+            self.num_patches,
+        )
 
-
-        if torch.distributed.get_rank()==0:
-            print("model.pos_embed.shape",self.pos_embed.shape,flush=True)
+        dist_print("model.pos_embed.shape", self.pos_embed.shape)
 
 
     def unpatchify(self, x: torch.Tensor, scaling =1, out_channels=1):

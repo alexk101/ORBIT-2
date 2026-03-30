@@ -1,19 +1,16 @@
 # Standard library
-from argparse import ArgumentParser
 import os
 import torch
 import functools
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import wrap, transformer_auto_wrap_policy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
-    CheckpointImpl,
     apply_activation_checkpointing,
 )
 from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import Sequential
 from datetime import timedelta
 import sys
@@ -23,20 +20,14 @@ import yaml
 # Third party
 import climate_learn as cl
 from climate_learn.data.processing.era5_constants import (
-    PRESSURE_LEVEL_VARS,
-    DEFAULT_PRESSURE_LEVELS,
     CONSTANTS,
 )
 from climate_learn.models.hub.components.vit_blocks import Block
-from climate_learn.models.hub.components.cnn_blocks import (
-    DownBlock,
-    MiddleBlock,
-    UpBlock,
-    ResidualBlock,
-)
+
 from climate_learn.utils.fused_attn import FusedAttn, parse_fused_attn
 from climate_learn.models.hub.components.pos_embed import interpolate_pos_embed
-from utils import seed_everything, init_par_groups
+from climate_learn.utils.logging import dist_print
+from utils import seed_everything, init_par_groups, log_gpu_memory
 
 
 def validate_data_type(data_type):
@@ -56,18 +47,6 @@ def validate_data_type(data_type):
             f"float16 is no longer supported due to numerical stability issues. "
             f"Please use 'bfloat16' for 16-bit training or 'float32' for full precision."
         )
-
-
-def log_gpu_memory(device, message="", world_rank=None):
-    """Log GPU memory usage with optional message and rank."""
-    memory_gb = torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024
-    if world_rank is not None:
-        print(
-            f"rank {world_rank} {message} torch.cuda.memory_reserved: {memory_gb:.2f}GB",
-            flush=True,
-        )
-    else:
-        print(f"{message} torch.cuda.memory_reserved: {memory_gb:.2f}GB", flush=True)
 
 
 def get_tensor_parallel_checkpoint_path(base_path, rank, tensor_par_size):
@@ -178,7 +157,7 @@ def load_checkpoint_pretrain(
             if not isExist:
                 # Create a new directory because it does not exist
                 os.makedirs(cp_save_path)
-                print("The new checkpoint saving directory is created!")
+                dist_print("The new checkpoint saving directory is created!")
 
             # Save initial model weights and distribute to all GPUs in the tensor
             # parallel group to synchronize model weights that do not belong to the
@@ -190,12 +169,11 @@ def load_checkpoint_pretrain(
                 if ("attn" not in k and "mlp" not in k and "var_agg" not in k)
             }
 
-            print(
+            dist_print(
                 "training from scratch and tensor_par_size>1. rank",
                 world_rank,
                 "init_model_dict.keys()",
                 init_model_dict.keys(),
-                flush=True,
             )
 
             torch.save(
@@ -227,37 +205,35 @@ def _load_pretrained_weights(model, pretrain_path, device, world_rank):
     map_location = "cpu"
     checkpoint = torch.load(pretrain_path, map_location=map_location)
 
-    print("Loading pre-trained checkpoint from: %s" % pretrain_path)
+    dist_print("Loading pre-trained checkpoint from: %s" % pretrain_path)
     pretrain_model = checkpoint["model_state_dict"]
 
     del checkpoint
 
     state_dict = model.state_dict()
 
-    if torch.distributed.get_rank() == 0:
-        for k in list(pretrain_model.keys()):
-            print(
-                "Pretrained model before deletion. Name ",
-                k,
-                "shape",
-                pretrain_model[k].shape,
-                flush=True,
-            )
+    for k in list(pretrain_model.keys()):
+        dist_print(
+            "Pretrained model before deletion. Name ",
+            k,
+            "shape",
+            pretrain_model[k].shape,
+        )
 
     for k in list(
         pretrain_model.keys()
     ):  # in pre-train model weights, but not fine-tuning model
         if k not in state_dict.keys():
-            print(f"Removing key {k} from pretrained checkpoint: no exist")
+            dist_print(f"Removing key {k} from pretrained checkpoint: no exist")
             del pretrain_model[k]
         elif (
             pretrain_model[k].shape != state_dict[k].shape
         ):  # if pre-train and fine-tune model weights dimension doesn't match
             if k == "pos_embed":
-                print("interpolate positional embedding", flush=True)
+                dist_print("interpolate positional embedding")
                 interpolate_pos_embed(model, pretrain_model, new_size=model.img_size)
             else:
-                print(
+                dist_print(
                     f"Removing key {k} from pretrained checkpoint: no matching shape",
                     pretrain_model[k].shape,
                     state_dict[k].shape,
@@ -266,7 +242,7 @@ def _load_pretrained_weights(model, pretrain_path, device, world_rank):
 
     # load pre-trained model
     msg = model.load_state_dict(pretrain_model, strict=False)
-    print(msg)
+    dist_print(msg)
     del pretrain_model
 
 
@@ -416,8 +392,7 @@ def setup_environment(local_rank):
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
 
-    # Print process information
-    print(f"Rank {world_rank}/{world_size} using device {device}", flush=True)
+    dist_print(f"Rank {world_rank}/{world_size} using device {device}")
 
     return device, world_size, world_rank, local_rank
 
@@ -463,12 +438,10 @@ def create_model_and_optimizer(
         model_kwargs=model_kwargs,
     )
 
-    if world_rank == 0:
-        print(f"Created model: {preset}", flush=True)
-        print(
-            f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M",
-            flush=True,
-        )
+    dist_print(f"Created model: {preset}")
+    dist_print(
+        f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M",
+    )
 
     # Extract optimizer configuration
     lr = float(config["model"]["lr"])
@@ -535,11 +508,10 @@ def create_data_module(data_key, config, world_rank, device, do_tiling, div, ove
     in_vars = dict_in_variables.get(data_key, default_vars)
     out_vars = dict_out_variables.get(data_key, ["2m_temperature"])
 
-    if world_rank == 0:
-        print(f"Creating data module for {data_key}", flush=True)
-        print(f"Input variables: {in_vars}", flush=True)
-        print(f"Output variables: {out_vars}", flush=True)
-        log_gpu_memory(device, f"before data_module {data_key}")
+    dist_print(f"Creating data module for {data_key}")
+    dist_print(f"Input variables: {in_vars}")
+    dist_print(f"Output variables: {out_vars}")
+    log_gpu_memory(device, f"before data_module {data_key}")
 
     # Create data module
     data_module = cl.data.IterDataModule(
@@ -560,16 +532,13 @@ def create_data_module(data_key, config, world_rank, device, do_tiling, div, ove
         yinp = yout // 4 + overlap
 
         if yinp % patch_size != 0:
-            if world_rank == 0:
-                print(f"Tile height: {yinp}, patch_size {patch_size}", flush=True)
-                print(
-                    f"Overlap must be adjusted to accommodate patch_size. Need to increase by {yinp % patch_size}",
-                    flush=True,
-                )
+            dist_print(f"Tile height: {yinp}, patch_size {patch_size}")
+            dist_print(
+                f"Overlap must be adjusted to accommodate patch_size. Need to increase by {yinp % patch_size}",
+            )
             sys.exit("Please adjust overlap according to the instructions above")
 
-    if world_rank == 0:
-        log_gpu_memory(device, f"after data_module {data_key}")
+    log_gpu_memory(device, f"after data_module {data_key}")
 
     # Create data loaders
     train_dataloader = data_module.train_dataloader(
@@ -634,8 +603,7 @@ def run_training_epochs(
         model.train()
         epoch_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
         
-        if world_rank == 0:
-            print(f"Starting epoch {epoch}", flush=True)
+        dist_print(f"Starting epoch {epoch}")
 
         for batch_idx, batch in enumerate(train_dataloader):
             if world_rank == 0:
@@ -666,26 +634,21 @@ def run_training_epochs(
                 if scaler._scale < min_scale:
                     scaler._scale = torch.tensor(min_scale).to(scaler._scale)
 
-            if world_rank == 0:
-                log_gpu_memory(
-                    device,
-                    f"batch_idx {batch_idx} get_lr {scheduler.get_lr()} after optimizer step",
-                    world_rank,
-                )
+            log_gpu_memory(
+                device,
+                f"batch_idx {batch_idx} get_lr {scheduler.get_lr()} after optimizer step",
+                world_rank,
+            )
 
             if world_rank == 0:
                 torch.cuda.synchronize(device=device)
                 tic4 = time.perf_counter()
                 if batch_idx % 10 == 0:
-                    print(
-                        f"Batch {batch_idx}: {(tic4-tic1):0.4f} seconds",
-                        flush=True,
-                    )
+                    dist_print(f"Batch {batch_idx}: {(tic4-tic1):0.4f} seconds")
 
         scheduler.step()
 
-        if world_rank == 0:
-            print(f"Epoch {epoch} completed. Loss: {epoch_loss.item()}", flush=True)
+        dist_print(f"Epoch {epoch} completed. Loss: {epoch_loss.item()}")
 
         save_checkpoint(
             model,
@@ -731,11 +694,10 @@ def save_checkpoint(
     if world_rank == 0:
         if not os.path.exists(cp_save_path):
             os.makedirs(cp_save_path)
-            print(f"Created checkpoint directory: {cp_save_path}", flush=True)
+            dist_print(f"Created checkpoint directory: {cp_save_path}")
 
     # Log memory before saving
-    if world_rank == 0:
-        log_gpu_memory(device, "Before torch.save", world_rank)
+    log_gpu_memory(device, "Before torch.save", world_rank)
 
     # Get model, optimizer, and scheduler states
     model_states = model.state_dict()
@@ -757,8 +719,7 @@ def save_checkpoint(
 
         torch.save(checkpoint_dict, file_name)
 
-        if world_rank == 0:
-            print(f"Saved checkpoint to: {file_name}", flush=True)
+        dist_print(f"Saved checkpoint to: {file_name}")
 
     # Log memory after saving
     log_gpu_memory(device, "After torch.save", world_rank)
@@ -783,8 +744,7 @@ def parse_config(config_path, world_rank):
     Returns:
         dict: Configuration dictionary with all parameters
     """
-    if world_rank == 0:
-        print(f"Loading config from: {config_path}", flush=True)
+    dist_print(f"Loading config from: {config_path}")
 
     # Load YAML configuration
     with open(config_path, "r") as f:
@@ -863,20 +823,18 @@ def main(device):
     world_rank = dist.get_rank()
     local_rank = int(os.environ["SLURM_LOCALID"])
 
-    print(
+    dist_print(
         "world_size",
         world_size,
         "world_rank",
         world_rank,
         "local_rank",
         local_rank,
-        flush=True,
     )
 
     config_path = sys.argv[1]
 
-    if world_rank == 0:
-        print("config_path", config_path, flush=True)
+    dist_print("config_path", config_path)
 
     conf = yaml.load(open(config_path, "r"), Loader=yaml.FullLoader)
 
@@ -941,33 +899,31 @@ def main(device):
 
     data_par_size = fsdp_size * simple_ddp_size
 
-    if world_rank == 0:
-        print("\n" + "=" * 80)
-        print("Training Configuration Summary")
-        print("=" * 80)
-        print(f"Model: {preset}, Parameters: {embed_dim}d {depth}L {num_heads}H")
-        print(f"Training: {max_epochs} epochs, batch_size={batch_size}, lr={lr}")
-        print(f"Data type: {data_type}, Loss: {train_loss_str}")
-        print(f"Checkpoint: {checkpoint_path if checkpoint_path else 'None'}")
-        print(f"Pretrain: {pretrain_path if pretrain_path else 'None'}")
-        print("=" * 80 + "\n", flush=True)
-        print(
-            "data_par_size",
-            data_par_size,
-            "fsdp_size",
-            fsdp_size,
-            "simple_ddp_size",
-            simple_ddp_size,
-            "tensor_par_size",
-            tensor_par_size,
-            "seq_par_size",
-            seq_par_size,
-            "division",
-            div,
-            "overlap",
-            overlap,
-            flush=True,
-        )
+    dist_print("\n" + "=" * 80)
+    dist_print("Training Configuration Summary")
+    dist_print("=" * 80)
+    dist_print(f"Model: {preset}, Parameters: {embed_dim}d {depth}L {num_heads}H")
+    dist_print(f"Training: {max_epochs} epochs, batch_size={batch_size}, lr={lr}")
+    dist_print(f"Data type: {data_type}, Loss: {train_loss_str}")
+    dist_print(f"Checkpoint: {checkpoint_path if checkpoint_path else 'None'}")
+    dist_print(f"Pretrain: {pretrain_path if pretrain_path else 'None'}")
+    dist_print("=" * 80 + "\n")
+    dist_print(
+        "data_par_size",
+        data_par_size,
+        "fsdp_size",
+        fsdp_size,
+        "simple_ddp_size",
+        simple_ddp_size,
+        "tensor_par_size",
+        tensor_par_size,
+        "seq_par_size",
+        seq_par_size,
+        "division",
+        div,
+        "overlap",
+        overlap,
+    )
 
     # initialize parallelism groups
     (
@@ -997,8 +953,7 @@ def main(device):
     else:
         FusedAttn_option = FusedAttn.DEFAULT
 
-    if world_rank == 0:
-        print(f"Fused attention backend: {FusedAttn_option}", flush=True)
+    dist_print(f"Fused attention backend: {FusedAttn_option}")
 
     model_kwargs = {
         "default_vars": default_vars,
@@ -1017,11 +972,10 @@ def main(device):
         "FusedAttn_option": FusedAttn_option,
     }
 
-    if world_rank == 0:
-        print("model_kwargs", model_kwargs, flush=True)
+    dist_print("model_kwargs", model_kwargs)
 
     if preset != "vit" and preset != "res_slimvit":
-        print("Only supports vit or residual slim vit training.", flush=True)
+        dist_print("Only supports vit or residual slim vit training.")
         sys.exit("Not vit or res_slimvit architecture")
 
     # if both checkpoint and pretrain are available, use checkpoint
@@ -1041,8 +995,7 @@ def main(device):
     if data_type == "bfloat16":
         scaler = ShardedGradScaler(init_scale=8192, growth_interval=100)
         min_scale = 128
-        if world_rank == 0:
-            print("initialize ShardedGradScaler for bfloat16", flush=True)
+        dist_print("initialize ShardedGradScaler for bfloat16")
     else:
         scaler = None
         min_scale = None
@@ -1055,13 +1008,12 @@ def main(device):
             in_vars = dict_in_variables[data_key]
             out_vars = dict_out_variables[data_key]
 
-            if world_rank == 0:
-                print("***************************", flush=True)
-                print("data_key is ", data_key, flush=True)
-                print("in_vars", in_vars, flush=True)
-                print("out_vars", out_vars, flush=True)
-                print("default_vars", default_vars, flush=True)
-                log_gpu_memory(device, "before data_module")
+            dist_print("***************************")
+            dist_print("data_key is ", data_key)
+            dist_print("in_vars", in_vars)
+            dist_print("out_vars", out_vars)
+            dist_print("default_vars", default_vars)
+            log_gpu_memory(device, "before data_module")
 
             # load data module
             data_module = cl.data.IterDataModule(
@@ -1087,20 +1039,18 @@ def main(device):
                 yout = len(lat) // div
                 yinp = yout // 4 + overlap
                 if yinp % patch_size != 0:
-                    if world_rank == 0:
-                        print(f"Tile height: {yinp}, patch_size {patch_size}")
-                        print(
-                            "Overlap must be adjusted to accommodate patch_size of the "
-                            "Transformer. Need to increase the overlap by ",
-                            (yinp % patch_size),
-                        )
-                        sys.exit(
-                            "Please increase the overlap accordingly to the instructions "
-                            "in the print message"
-                        )
+                    dist_print(f"Tile height: {yinp}, patch_size {patch_size}")
+                    dist_print(
+                        "Overlap must be adjusted to accommodate patch_size of the "
+                        "Transformer. Need to increase the overlap by ",
+                        (yinp % patch_size),
+                    )
+                    sys.exit(
+                        "Please increase the overlap accordingly to the instructions "
+                        "in the print message"
+                    )
 
-            if world_rank == 0:
-                log_gpu_memory(device, "after data_module")
+            log_gpu_memory(device, "after data_module")
 
             if first_time_bool:
                 # Set up deep learning model
@@ -1125,13 +1075,10 @@ def main(device):
 
                 model = model.to(device)
 
-                if torch.distributed.get_rank() == 0:
-                    print("Loading model weights...", flush=True)
-                    # Print only model summary instead of all parameters
-                    total_params = sum(p.numel() for p in model.parameters())
-                    print(
-                        f"Total model parameters: {total_params / 1e6:.2f}M", flush=True
-                    )
+                dist_print("Loading model weights...")
+                # Print only model summary instead of all parameters
+                total_params = sum(p.numel() for p in model.parameters())
+                dist_print(f"Total model parameters: {total_params / 1e6:.2f}M")
 
                 # load from checkpoint for continued training , or from pretrained model weights
                 load_checkpoint_pretrain(
@@ -1181,7 +1128,7 @@ def main(device):
                 # hybrid sharded FSDP
                 if fsdp_size > 1 and simple_ddp_size > 1:
 
-                    print("enter hybrid FSDP", flush=True)
+                    dist_print("enter hybrid FSDP")
                     model = FSDP(
                         model,
                         device_id=local_rank,
@@ -1195,7 +1142,7 @@ def main(device):
                     )
                 # fully sharded FSDP
                 elif fsdp_size > 1 and simple_ddp_size == 1:
-                    print("enter fully sharded FSDP", flush=True)
+                    dist_print("enter fully sharded FSDP")
                     model = FSDP(
                         model,
                         device_id=local_rank,
@@ -1209,7 +1156,7 @@ def main(device):
                     )
                 else:
                     # no shard only
-                    print("enter NO SHARD only,", flush=True)
+                    dist_print("enter NO SHARD only,")
                     model = FSDP(
                         model,
                         device_id=local_rank,
@@ -1262,11 +1209,10 @@ def main(device):
 
                 if checkpoint_path is not None:
 
-                    print(
+                    dist_print(
                         "optimizer resume from checkpoint",
                         checkpoint_path,
                         " Checkpoint path found.",
-                        flush=True,
                     )
                     src_rank = world_rank - tensor_par_size * dist.get_rank(
                         group=data_seq_ort_group
@@ -1340,7 +1286,7 @@ if __name__ == "__main__":
         world_size=world_size,
     )
 
-    print("Using dist.init_process_group. world_size ", world_size, flush=True)
+    dist_print("Using dist.init_process_group. world_size ", world_size)
 
     main(device)
 

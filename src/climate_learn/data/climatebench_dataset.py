@@ -1,11 +1,12 @@
 import os
-from typing import Dict
 
 import numpy as np
 import torch
 import xarray as xr
 from torch.utils.data import Dataset
 from torchvision.transforms import transforms
+
+from climate_learn.utils.logging import dist_print
 
 
 def load_x_y(data_path, list_simu, out_var):
@@ -61,7 +62,7 @@ def load_x_y(data_path, list_simu, out_var):
                 .drop(["quantile"])
             )
 
-        print(input_xr.dims, output_xr.dims, simu)
+        dist_print(input_xr.dims, output_xr.dims, simu)
 
         x = input_xr.to_array().to_numpy()
         x = x.transpose(1, 0, 2, 3).astype(np.float32)  # N, C, H, W

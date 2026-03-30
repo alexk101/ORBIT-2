@@ -4,28 +4,22 @@ import os
 import torch
 import functools
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import wrap, transformer_auto_wrap_policy
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
-    CheckpointImpl,
     apply_activation_checkpointing,
 )
 from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn import Sequential
 from datetime import timedelta
 import sys
 import time
-import numpy as np
 
 # Third party
 import climate_learn as cl
 from climate_learn.data.processing.era5_constants import (
     PRESSURE_LEVEL_VARS,
-    DEFAULT_PRESSURE_LEVELS,
     SR_PRESSURE_LEVELS,
     CONSTANTS,
 )
@@ -36,6 +30,7 @@ from climate_learn.models.hub.components.cnn_blocks import (
     UpBlock,
     ResidualBlock,
 )
+from climate_learn.utils.logging import dist_print
 
 # Import common utilities
 from utils import seed_everything, log_gpu_memory
@@ -46,21 +41,18 @@ def load_checkpoint(model, checkpoint_path, device, world_rank=0):
     if not os.path.exists(checkpoint_path):
         sys.exit(f"Checkpoint path does not exist: {checkpoint_path}")
 
-    if world_rank == 0:
-        print(f"Loading checkpoint from: {checkpoint_path}", flush=True)
+    dist_print(f"Loading checkpoint from: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
     del checkpoint
 
-    if world_rank == 0:
-        print("Checkpoint loaded successfully", flush=True)
+    dist_print("Checkpoint loaded successfully")
 
 
 def load_training_state(optimizer, scheduler, checkpoint_path, world_rank=0):
     """Load optimizer and scheduler state from checkpoint."""
-    if world_rank == 0:
-        print(f"Loading training state from checkpoint: {checkpoint_path}", flush=True)
+    dist_print(f"Loading training state from checkpoint: {checkpoint_path}")
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -68,8 +60,7 @@ def load_training_state(optimizer, scheduler, checkpoint_path, world_rank=0):
     epoch_start = checkpoint["epoch"] + 1
     del checkpoint
 
-    if world_rank == 0:
-        print(f"Resuming from epoch {epoch_start}", flush=True)
+    dist_print(f"Resuming from epoch {epoch_start}")
 
     return epoch_start
 
@@ -78,57 +69,47 @@ def load_pretrained_weights(model, pretrained_path, device, world_rank=0):
     """Load pretrained weights into model."""
     checkpoint = torch.load(pretrained_path, map_location="cpu")
 
-    if world_rank == 0:
-        print(f"Loading pre-trained checkpoint from: {pretrained_path}")
+    dist_print(f"Loading pre-trained checkpoint from: {pretrained_path}")
 
     pretrain_model = checkpoint["model_state_dict"]
     del checkpoint
 
     state_dict = model.state_dict()
 
-    if world_rank == 0:
-        for k in list(pretrain_model.keys()):
-            print(f"Pretrained model before deletion. Name: {k}", flush=True)
+    for k in list(pretrain_model.keys()):
+        dist_print(f"Pretrained model before deletion. Name: {k}")
 
     # Remove or rename specific keys
     for k in list(pretrain_model.keys()):
         if "pos_embed" in k:
-            if world_rank == 0:
-                print(f"Removing pos_embed")
+            dist_print(f"Removing pos_embed")
             del pretrain_model[k]
         if "var_" in k:
-            if world_rank == 0:
-                print(f"Removing var_embed, var_query and var_agg")
+            dist_print(f"Removing var_embed, var_query and var_agg")
             del pretrain_model[k]
         if "token_embeds" in k:
-            if world_rank == 0:
-                print(f"Removing token_embed")
+            dist_print(f"Removing token_embed")
             del pretrain_model[k]
         if "channel" in k:
-            if world_rank == 0:
-                print(f"Renaming key: {k}")
+            dist_print(f"Renaming key: {k}")
             pretrain_model[k.replace("channel", "var")] = pretrain_model[k]
             del pretrain_model[k]
     # Remove keys that don't exist or have mismatched shapes
     for k in list(pretrain_model.keys()):
         if k not in state_dict.keys():
-            if world_rank == 0:
-                print(f"Removing key {k}: not in model")
+            dist_print(f"Removing key {k}: not in model")
             del pretrain_model[k]
         elif pretrain_model[k].shape != state_dict[k].shape:
-            if world_rank == 0:
-                print(
+            dist_print(
                     f"Removing key {k}: shape mismatch {pretrain_model[k].shape} vs {state_dict[k].shape}"
                 )
             del pretrain_model[k]
 
-    if world_rank == 0:
-        print(f"Loading {len(pretrain_model)} keys into model")
+    dist_print(f"Loading {len(pretrain_model)} keys into model")
 
     # load pre-trained model
     msg = model.load_state_dict(pretrain_model, strict=False)
-    if world_rank == 0:
-        print(f"Load state dict result: {msg}")
+    dist_print(f"Load state dict result: {msg}")
     del pretrain_model
 
 
@@ -184,7 +165,7 @@ def evaluate_func(batch, stage: str, net, device: int, loss_metrics, target_tran
         transforms = target_transforms
     elif stage == "test":
         loss_fns = loss_metrics
-        transforms = self.target_transforms
+        transforms = target_transforms
     else:
         raise RuntimeError("Invalid evaluation stage")
     loss_dict = {}
@@ -193,6 +174,9 @@ def evaluate_func(batch, stage: str, net, device: int, loss_metrics, target_tran
         if transforms is not None and transforms[i] is not None:
             yhat_ = transforms[i](yhat)
             y_ = transforms[i](y)
+        else:
+            yhat_ = yhat
+            y_ = y
         losses = lf(yhat_, y_)
         loss_name = getattr(lf, "name", f"loss_{i}")
         if losses.dim() == 0:  # aggregate loss
@@ -248,12 +232,9 @@ def setup_distributed():
     world_rank = dist.get_rank()
     local_rank = int(os.environ["SLURM_LOCALID"])
 
-    if world_rank == 0:
-        print(
-            f"Distributed setup: world_size={world_size}, world_rank={world_rank}, "
-            f"local_rank={local_rank}",
-            flush=True,
-        )
+    dist_print(
+        f"Distributed setup: world_size={world_size}, world_rank={world_rank}, local_rank={local_rank}"
+    )
 
     return world_size, world_rank, local_rank
 
@@ -293,8 +274,8 @@ def save_checkpoint(model, optimizer, scheduler, epoch, root_dir, world_rank, de
     optimizer_states = optimizer.state_dict()
     scheduler_states = scheduler.state_dict()
 
+    filename = f"{checkpoint_path}/ERA5-Daymet_epoch_{epoch}.ckpt"
     if world_rank == 0:
-        filename = f"{checkpoint_path}/ERA5-Daymet_epoch_{epoch}.ckpt"
         torch.save(
             {
                 "epoch": epoch,
@@ -304,7 +285,7 @@ def save_checkpoint(model, optimizer, scheduler, epoch, root_dir, world_rank, de
             },
             filename,
         )
-        print(f"Checkpoint saved: {filename}", flush=True)
+        dist_print(f"Checkpoint saved: {filename}")
 
     log_gpu_memory(device, "After saving checkpoint", world_rank)
 
@@ -320,8 +301,7 @@ def run_validation(
     """Run validation phase."""
     model.eval()
 
-    if world_rank == 0:
-        print(f"\nValidation - Epoch {epoch}", flush=True)
+    dist_print(f"\nValidation - Epoch {epoch}")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_dataloader):
@@ -333,16 +313,15 @@ def run_validation(
                 batch, batch_idx, model, device, val_losses, val_transforms
             )
 
-            if world_rank == 0:
-                print(
-                    f"Val epoch: {epoch}, batch_idx: {batch_idx}, " f"losses: {losses}",
-                    flush=True,
-                )
+            dist_print(
+                f"Val epoch: {epoch}, batch_idx: {batch_idx}, losses: {losses}",
+            )
 
+            if world_rank == 0:
                 torch.cuda.synchronize(device=device)
                 tic4 = time.perf_counter()
-                print(
-                    f"Validation batch time: {(tic4-tic1):0.4f} seconds\n", flush=True
+                dist_print(
+                    f"Validation batch time: {(tic4-tic1):0.4f} seconds",
                 )
 
 
@@ -370,8 +349,7 @@ def setup_input_variables(target_variable, world_rank=0):
         else:
             in_vars.append(var)
 
-    if world_rank == 0:
-        print(f"Input variables: {in_vars}", flush=True)
+    dist_print(f"Input variables: {in_vars}")
 
     return in_vars, out_var_dict[target_variable]
 
@@ -384,14 +362,12 @@ def main(device):
     # Parse command line arguments
     args = parse_arguments()
 
-    if world_rank == 0:
-        print(f"Arguments: {args}", flush=True)
+    dist_print(f"Arguments: {args}")
 
     # Checkpoint takes priority over pretrain
     if args.checkpoint is not None and args.pretrain is not None:
         args.pretrain = None
-        if world_rank == 0:
-            print("Using checkpoint instead of pretrain", flush=True)
+        dist_print("Using checkpoint instead of pretrain")
 
     # Setup input variables
     in_vars, out_var = setup_input_variables(args.variable, world_rank)
@@ -427,11 +403,9 @@ def main(device):
         train_target_transform=None,
     )
 
-    if world_rank == 0:
-        print(
-            f"Model setup: train_loss={train_loss}, train_transform={train_transform}",
-            flush=True,
-        )
+    dist_print(
+        f"Model setup: train_loss={train_loss}, train_transform={train_transform}",
+    )
 
     model = model.to(device)
 
@@ -475,8 +449,7 @@ def main(device):
         model, checkpoint_wrapper_fn=checkpoint_wrapper, check_fn=check_fn
     )
 
-    if world_rank == 0:
-        print(f"Model architecture:\n{model}", flush=True)
+    dist_print(f"Model architecture:\n{model}")
 
     # Setup optimizer and scheduler
     optimizer = cl.load_optimizer(
@@ -510,10 +483,10 @@ def main(device):
         model.train()
         epoch_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-        if world_rank == 0:
-            print(f"\n{'='*50}")
-            print(f"Epoch {epoch}/{args.max_epochs-1}")
-            print(f"{'='*50}", flush=True)
+        msg = f"\n{'='*50}"
+        msg += f"Epoch {epoch}/{args.max_epochs-1}"
+        msg += f"{'='*50}"
+        dist_print(msg)
 
         # Training phase
         for batch_idx, batch in enumerate(train_dataloader):
@@ -528,53 +501,33 @@ def main(device):
 
             epoch_loss += loss.detach()
 
-            if world_rank == 0:
-                print(
-                    "epoch: ",
-                    epoch,
-                    "batch_idx",
-                    batch_idx,
-                    "world_rank",
-                    world_rank,
-                    " loss ",
-                    loss,
-                    flush=True,
-                )
+            dist_print(
+                f"epoch: {epoch}, batch_idx: {batch_idx}, world_rank: {world_rank}, loss: {loss}"
+            )
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            if world_rank == 0:
-                if batch_idx % 10 == 0:
-                    print(
-                        "rank",
-                        world_rank,
-                        "batch_idx",
-                        batch_idx,
-                        "get_lr ",
-                        scheduler.get_lr(),
-                        "after optimizer step torch.cuda.memory_reserved: %fGB"
-                        % (torch.cuda.memory_reserved(device) / 1024 / 1024 / 1024),
-                        flush=True,
-                    )
+            if batch_idx % 10 == 0:
+                gpu_mem = torch.cuda.memory_reserved(device) / (1024**3)
+                msg = f"batch_idx: {batch_idx}, world_rank: {world_rank}, lr: {scheduler.get_lr()}"
+                msg += f" after optimizer step torch.cuda.memory_reserved: {gpu_mem:.2f}GB"
+                dist_print(msg)
+
 
             if world_rank == 0:
                 torch.cuda.synchronize(device=device)
                 tic4 = time.perf_counter()
-                print(
-                    f"my rank {dist.get_rank()}. tic4-tic1 in {(tic4-tic1):0.4f} seconds\n",
-                    flush=True,
+                dist_print(
+                    f"Batch timing: {(tic4-tic1):0.4f} seconds (batch_idx={batch_idx})",
                 )
 
         scheduler.step()
 
         if world_rank == 0:
             epoch_loss = epoch_loss / (batch_idx + 1)
-            print("epoch: ", epoch, " epoch_loss ", epoch_loss, flush=True)
-
-        if world_rank == 0:
-            print(f"Epoch {epoch} loss: {epoch_loss.item():.6f}", flush=True)
+            dist_print(f"Epoch {epoch} mean loss: {epoch_loss.item():.6f}")
 
         # Save checkpoint periodically
         if epoch % 5 == 0 or epoch == args.max_epochs - 1:
@@ -618,8 +571,7 @@ if __name__ == "__main__":
         world_size=world_size,
     )
 
-    if world_rank == 0:
-        print(f"Distributed training initialized. World size: {world_size}", flush=True)
+    dist_print(f"Distributed training initialized. World size: {world_size}")
 
     # Run main training
     main(device)

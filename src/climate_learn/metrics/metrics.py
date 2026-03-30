@@ -5,21 +5,22 @@ from typing import Callable, Optional, Union, List, Dict
 from .utils import MetricsMetaInfo, register
 from .functional import *
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import wrap, transformer_auto_wrap_policy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-checkpoint_wrapper,
-CheckpointImpl,
-apply_activation_checkpointing,
+    checkpoint_wrapper,
+    apply_activation_checkpointing,
 )
 import functools
-from torchvision.models import vgg16
 import numpy as np
 import torch
 import os
 from torch.nn import Sequential
 import lpips
-from lpips import NetLinLayer 
+
+from climate_learn.utils.logging import dist_print
+
+
 class Metric:
     """Parent class for all ClimateLearn metrics."""
 
@@ -164,8 +165,7 @@ class PERCEPTUAL(Metric):
 
 
 
-        if torch.distributed.get_rank()==0:
-            print("inside PERCEPTUAL after FSDP","self.loss_fn",self.loss_fn,flush=True)
+        dist_print("inside PERCEPTUAL after FSDP", "self.loss_fn", self.loss_fn)
 
         super().__init__(aggregate_only, metainfo)
 

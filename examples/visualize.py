@@ -17,31 +17,22 @@ import os
 import functools
 from argparse import ArgumentParser
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.wrap import wrap, transformer_auto_wrap_policy
-from torch.cuda.amp.grad_scaler import GradScaler
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 import torch.distributed as dist
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
-    CheckpointImpl,
     apply_activation_checkpointing,
 )
 from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-from torch.nn.parallel import DistributedDataParallel as DDP
 from datetime import timedelta
 import sys
-import time
 import yaml
 
-from climate_learn.data.processing.era5_constants import (
-    PRESSURE_LEVEL_VARS,
-    DEFAULT_PRESSURE_LEVELS,
-    CONSTANTS,
-)
 from climate_learn.models.hub.components.vit_blocks import Block
 from torch.nn import Sequential
 from climate_learn.models.hub.components.pos_embed import interpolate_pos_embed
 from climate_learn.utils.fused_attn import FusedAttn
+from climate_learn.utils.logging import dist_print
 from utils import seed_everything, init_par_groups
 
 
@@ -132,36 +123,34 @@ def _load_pretrained_weights(model, pretrain_path, device, world_rank):
     map_location = "cpu"
     checkpoint = torch.load(pretrain_path, map_location=map_location)
 
-    print("Loading pre-trained checkpoint from: %s" % pretrain_path)
+    dist_print("Loading pre-trained checkpoint from: %s" % pretrain_path)
     pretrain_model = checkpoint["model_state_dict"]
 
     del checkpoint
 
     state_dict = model.state_dict()
 
-    if torch.distributed.get_rank() == 0:
-        for k in list(pretrain_model.keys()):
-            print(
-                "Pretrained model before deletion. Name ",
-                k,
-                "shape",
-                pretrain_model[k].shape,
-                flush=True,
-            )
+    for k in list(pretrain_model.keys()):
+        dist_print(
+            "Pretrained model before deletion. Name ",
+            k,
+            "shape",
+            pretrain_model[k].shape,
+        )
 
     # Remove keys that don't exist in the target model or have shape mismatches
     for k in list(pretrain_model.keys()):  # Iterate through pretrained model keys
         if k not in state_dict.keys():
-            print(f"Removing key {k} from pretrained checkpoint: no exist")
+            dist_print(f"Removing key {k} from pretrained checkpoint: no exist")
             del pretrain_model[k]
         elif (
             pretrain_model[k].shape != state_dict[k].shape
         ):  # if pre-train and fine-tune model weights dimension doesn't match
             if k == "pos_embed":
-                print("interpolate positional embedding", flush=True)
+                dist_print("interpolate positional embedding")
                 interpolate_pos_embed(model, pretrain_model, new_size=model.img_size)
             else:
-                print(
+                dist_print(
                     f"Removing key {k} from pretrained checkpoint: no matching shape",
                     pretrain_model[k].shape,
                     state_dict[k].shape,
@@ -170,7 +159,7 @@ def _load_pretrained_weights(model, pretrain_path, device, world_rank):
 
     # Load pre-trained model
     msg = model.load_state_dict(pretrain_model, strict=False)
-    print(msg)
+    dist_print(msg)
     del pretrain_model
 
 
@@ -242,8 +231,7 @@ def main():
 
     config_path = args.config
 
-    if world_rank == 0:
-        print("config_path", config_path, flush=True)
+    dist_print("config_path", config_path)
 
     conf = yaml.load(open(config_path, "r"), Loader=yaml.FullLoader)
 
@@ -257,12 +245,10 @@ def main():
     # Priority: 1) Command line argument, 2) Config pretrain path
     if args.checkpoint:
         pretrain_path = args.checkpoint
-        if world_rank == 0:
-            print(f"Using checkpoint from command line: {pretrain_path}", flush=True)
+        dist_print(f"Using checkpoint from command line: {pretrain_path}")
     else:
         pretrain_path = conf["trainer"]["pretrain"]
-        if world_rank == 0:
-            print(f"Using checkpoint from config: {pretrain_path}", flush=True)
+        dist_print(f"Using checkpoint from config: {pretrain_path}")
     # Use command line override if provided, otherwise use config value
     # Force float32 for visualization to avoid numpy conversion issues with bfloat16
     data_type = args.data_type or "float32"
@@ -270,8 +256,10 @@ def main():
     # Validate data type
     validate_data_type(data_type)
     
-    if world_rank == 0 and conf["trainer"].get("data_type") == "bfloat16":
-        print("Note: Forcing float32 for visualization (bfloat16 not supported for numpy conversion)", flush=True)
+    if conf["trainer"].get("data_type") == "bfloat16":
+        dist_print(
+            "Note: Forcing float32 for visualization (bfloat16 not supported for numpy conversion)"
+        )
 
     # Load tiling configuration for TILES algorithm
     try:
@@ -283,7 +271,7 @@ def main():
             div = 1
             overlap = 0
     except Exception:
-        print("Tiling parameter not found. Using default: no tiling", flush=True)
+        dist_print("Tiling parameter not found. Using default: no tiling")
         do_tiling = False
         div = 1
         overlap = 0
@@ -323,83 +311,80 @@ def main():
 
     data_par_size = fsdp_size * simple_ddp_size
 
-    if world_rank == 0:
-        print(
-            "max_epochs",
-            max_epochs,
-            " ",
-            checkpoint_path,
-            " ",
-            pretrain_path,
-            " ",
-            low_res_dir,
-            " ",
-            high_res_dir,
-            "preset",
-            preset,
-            "dict_out_variables",
-            dict_out_variables,
-            "lr",
-            lr,
-            "beta_1",
-            beta_1,
-            "beta_2",
-            beta_2,
-            "weight_decay",
-            weight_decay,
-            "warmup_epochs",
-            warmup_epochs,
-            "warmup_start_lr",
-            warmup_start_lr,
-            "eta_min",
-            eta_min,
-            "superres_mag",
-            superres_mag,
-            "cnn_ratio",
-            cnn_ratio,
-            "patch_size",
-            patch_size,
-            "embed_dim",
-            embed_dim,
-            "depth",
-            depth,
-            "decoder_depth",
-            decoder_depth,
-            "num_heads",
-            num_heads,
-            "mlp_ratio",
-            mlp_ratio,
-            "drop_path",
-            drop_path,
-            "drop_rate",
-            drop_rate,
-            "batch_size",
-            batch_size,
-            "num_workers",
-            num_workers,
-            "buffer_size",
-            buffer_size,
-            flush=True,
-        )
-        print(
-            "data_par_size",
-            data_par_size,
-            "fsdp_size",
-            fsdp_size,
-            "simple_ddp_size",
-            simple_ddp_size,
-            "tensor_par_size",
-            tensor_par_size,
-            "seq_par_size",
-            seq_par_size,
-            "FusedAttn_option",
-            FusedAttn_option,
-            "div",
-            div,
-            "overlap",
-            overlap,
-            flush=True,
-        )
+    dist_print(
+        "max_epochs",
+        max_epochs,
+        " ",
+        checkpoint_path,
+        " ",
+        pretrain_path,
+        " ",
+        low_res_dir,
+        " ",
+        high_res_dir,
+        "preset",
+        preset,
+        "dict_out_variables",
+        dict_out_variables,
+        "lr",
+        lr,
+        "beta_1",
+        beta_1,
+        "beta_2",
+        beta_2,
+        "weight_decay",
+        weight_decay,
+        "warmup_epochs",
+        warmup_epochs,
+        "warmup_start_lr",
+        warmup_start_lr,
+        "eta_min",
+        eta_min,
+        "superres_mag",
+        superres_mag,
+        "cnn_ratio",
+        cnn_ratio,
+        "patch_size",
+        patch_size,
+        "embed_dim",
+        embed_dim,
+        "depth",
+        depth,
+        "decoder_depth",
+        decoder_depth,
+        "num_heads",
+        num_heads,
+        "mlp_ratio",
+        mlp_ratio,
+        "drop_path",
+        drop_path,
+        "drop_rate",
+        drop_rate,
+        "batch_size",
+        batch_size,
+        "num_workers",
+        num_workers,
+        "buffer_size",
+        buffer_size,
+    )
+    dist_print(
+        "data_par_size",
+        data_par_size,
+        "fsdp_size",
+        fsdp_size,
+        "simple_ddp_size",
+        simple_ddp_size,
+        "tensor_par_size",
+        tensor_par_size,
+        "seq_par_size",
+        seq_par_size,
+        "FusedAttn_option",
+        FusedAttn_option,
+        "div",
+        div,
+        "overlap",
+        overlap,
+    )
 
     # Initialize distributed parallel process groups for model training
     # Returns: seq_par_group, data_par_group, tensor_par_group, data_seq_ort_group, fsdp_group, simple_ddp_group
@@ -429,11 +414,10 @@ def main():
         "FusedAttn_option": FusedAttn_option,
     }
 
-    if world_rank == 0:
-        print("model_kwargs", model_kwargs, flush=True)
+    dist_print("model_kwargs", model_kwargs)
 
     if preset != "vit" and preset != "res_slimvit":
-        print("Only supports vit or residual slim vit training.", flush=True)
+        dist_print("Only supports vit or residual slim vit training.")
         sys.exit("Not vit or res_slimvit architecture")
 
     # Set up data
@@ -445,15 +429,14 @@ def main():
             break
 
     if data_key is None:
-        print("No matching dataset found in config. Using first available key.")
+        dist_print("No matching dataset found in config. Using first available key.")
         data_key = list(dict_in_variables.keys())[0]
 
     in_vars = dict_in_variables[data_key]
     out_vars = dict_out_variables[data_key]
 
-    if world_rank == 0:
-        print("in_vars", in_vars, flush=True)
-        print("out_vars", out_vars, flush=True)
+    dist_print("in_vars", in_vars)
+    dist_print("out_vars", out_vars)
 
     # Initialize data module for training data with tiling support
     data_module = cl.data.IterDataModule(
@@ -507,23 +490,21 @@ def main():
         device, data_module=data_module, architecture=preset, model_kwargs=model_kwargs
     )
 
-    if dist.get_rank() == 0:
-        print(
-            "train_loss",
-            train_loss,
-            "train_transform",
-            train_transform,
-            "img_size",
-            model.img_size,
-            flush=True,
-        )
+    dist_print(
+        "train_loss",
+        train_loss,
+        "train_transform",
+        train_transform,
+        "img_size",
+        model.img_size,
+    )
 
     model = model.to(device)
 
     # Get denormalization transform for converting model outputs back to physical units
     denorm = test_transforms[0]
 
-    print("denorm is ", denorm, flush=True)
+    dist_print("denorm is ", denorm)
 
     # Load pretrained model weights from checkpoint
     load_pretrained_weights(
@@ -534,10 +515,9 @@ def main():
         tensor_par_group=tensor_par_group,
     )
 
-    if torch.distributed.get_rank() == 0:
-        print("model is ", model, flush=True)
+    dist_print("model is ", model)
 
-    print(
+    dist_print(
         "rank",
         dist.get_rank(),
         "model.var_query[0,0,0]",
@@ -550,7 +530,6 @@ def main():
         model.pos_embed[0, 0, 1],
         "conv_out.weight",
         model.conv_out.weight[0, 0, 0, 0],
-        flush=True,
     )
 
     # Set random seed for reproducibility
@@ -589,7 +568,7 @@ def main():
     )
 
     # Wrap model with Fully Sharded Data Parallel for distributed training
-    print("enter fully sharded FSDP", flush=True)
+    dist_print("enter fully sharded FSDP")
     model = FSDP(
         model,
         device_id=local_rank,
@@ -612,7 +591,7 @@ def main():
     # based on datasets
     in_shape, _ = data_module.get_data_dims()
             
-    print("in_shape is ",in_shape,flush=True)
+    dist_print("in_shape is ", in_shape)
 
     _,_, in_height, in_width = in_shape
 

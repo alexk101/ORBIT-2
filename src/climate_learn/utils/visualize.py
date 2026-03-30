@@ -13,6 +13,7 @@ from scipy.stats import rankdata
 from ..data.processing.era5_constants import VAR_TO_UNIT as ERA5_VAR_TO_UNIT
 from ..data.processing.cmip6_constants import VAR_TO_UNIT as CMIP6_VAR_TO_UNIT
 from climate_learn.data.processing.era5_constants import CONSTANTS
+from climate_learn.utils.logging import dist_print
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -659,18 +660,17 @@ def visualize_at_index(
             logger.info(
                 f"Metrics - PSNR: {metrics['psnr']:.4f}, SSIM: {metrics['ssim']:.4f}"
             )
-            print(
+            dist_print(
                 f"Goodness of fit: PSNR {metrics['psnr']:.6f}, SSIM {metrics['ssim']:.6f}"
             )
 
     # Print shape info for backward compatibility with original code
-    if dist.get_rank() == 0:
-        print(
-            f"img.shape {images['input'].shape}, min {images['input'].min()}, max {images['input'].max()}"
-        )
-        print(
-            f"ppred.shape {images['prediction'].shape}, min {images['prediction'].min()}, max {images['prediction'].max()}"
-        )
+    dist_print(
+        f"img.shape {images['input'].shape}, min {images['input'].min()}, max {images['input'].max()}"
+    )
+    dist_print(
+        f"ppred.shape {images['prediction'].shape}, min {images['prediction'].min()}, max {images['prediction'].max()}"
+    )
 
     return None  # Returns None to match original API
 
