@@ -44,8 +44,7 @@ model:
   mlp_ratio: 4
   drop_path: 0.1
   drop_rate: 0.1
-  # Optional: force attention backend (overrides gpu_type heuristic). One of: ck, default, none
-  # fused_attn: default
+  fused_attn: default
 
 # ---------------------------- DATA -------------------------------------------
 data:
