@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -A lrn036
+#SBATCH -A GEO163
 #SBATCH -J flash
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
@@ -22,21 +22,11 @@ source ~/miniconda3/etc/profile.d/conda.sh
 
 
 module load PrgEnv-gnu
-module load rocm/6.3.1
+module load rocm/6.4.2
 module load craype-accel-amd-gfx90a
 
-module unload darshan-runtime
-module unload libfabric
 
-
-#eval "$(/lustre/orion/world-shared/stf218/atsaris/env_test_march/miniconda/bin/conda shell.bash hook)"
-
-conda activate /lustre/orion/lrn036/world-shared/xf9/torch27
-
-#source activate /lustre/orion/lrn036/world-shared/xf9/torch27-rocm63
-#conda activate /lustre/orion/lrn036/world-shared/xf9/torch26
-
-#export LD_LIBRARY_PATH=/lustre/orion/world-shared/stf218/junqi/climax/rccl-plugin-rocm6/lib/:/opt/rocm-6.2.0/lib:$LD_LIBRARY_PATH
+source activate /lustre/orion/geo163/world-shared/python-envs/torch-2.9.1-rocm-6.4.2
 
 ## DDStore and GPTL Timer
 
@@ -83,4 +73,3 @@ export LD_PRELOAD=/lib64/libgcc_s.so.1:/usr/lib64/libstdc++.so.6
 
 time srun -n $((SLURM_JOB_NUM_NODES*8)) \
 python ./intermediate_downscaling.py ../configs/interm_8m.yaml
-

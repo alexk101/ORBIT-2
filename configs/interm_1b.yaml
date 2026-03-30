@@ -14,8 +14,8 @@ trainer:
 #----------  Parallelism -------------
 parallelism:
   fsdp: 8
-  simple_ddp: 4
-  tensor_par: 4
+  simple_ddp: 2
+  tensor_par: 2
   seq_par: 1
  
 ### Tiling
