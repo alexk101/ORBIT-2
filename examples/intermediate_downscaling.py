@@ -385,6 +385,23 @@ def evaluate_func(batch, stage: str, net, device: int, loss_metrics, target_tran
     return loss_dict
 
 
+def _wandb_log_scalars(run, metrics: dict, step: int) -> None:
+    """Log scalars to W&B; skip NaN/Inf keys (some clients drop the whole step otherwise)."""
+    if run is None:
+        return
+    clean = {}
+    for k, v in metrics.items():
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            continue
+        clean[k] = v
+    if not clean:
+        return
+    try:
+        run.log(clean, step=step, commit=True)
+    except Exception as e:
+        dist_print(f"wandb.log failed at step {step}: {e}")
+
+
 def _grad_norm_after_backward(model, scaler, optimizer, data_type: str) -> float:
     """Total gradient L2 norm; call after backward, before optimizer/scaler step."""
     if data_type != "float32":
@@ -875,7 +892,7 @@ def run_training_epochs(
                     else float("nan")
                 )
 
-                if world_rank == 0:
+                if dist.get_rank() == 0:
                     dist_print(
                         f"[interval step {train_monitor['global_step']}] "
                         f"data_key={data_key} "
@@ -883,8 +900,10 @@ def run_training_epochs(
                         f"lr={lr0:.6g} grad_norm={gnorm} "
                         f"weight_norm={weight_norm:.6g}"
                     )
-                if wandb_run is not None and world_rank == 0:
-                    wandb.log(
+                # Use dist.get_rank() so this matches dist_print (avoids SLURM vs PG mismatch).
+                if wandb_run is not None and dist.get_rank() == 0:
+                    _wandb_log_scalars(
+                        wandb_run,
                         {
                             "train/loss": avg_train,
                             "val/loss": val_loss,
@@ -893,7 +912,7 @@ def run_training_epochs(
                             "train/weight_norm": weight_norm,
                             "epoch": epoch,
                         },
-                        step=train_monitor["global_step"],
+                        train_monitor["global_step"],
                     )
                 dist.barrier(device_ids=[local_rank])
 
@@ -1672,7 +1691,7 @@ def main(device):
             if first_time_bool:
                 first_time_bool = False
 
-    if world_rank == 0 and wandb_run is not None:
+    if dist.get_rank() == 0 and wandb_run is not None:
         wandb.finish()
 
 
