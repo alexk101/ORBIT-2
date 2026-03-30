@@ -17,6 +17,7 @@ from torch.nn import Sequential
 from datetime import timedelta
 import sys
 import time
+import math
 import yaml
 
 # Third party
@@ -553,13 +554,20 @@ def create_model_and_optimizer(
     if spe_cfg is not None:
         steps_per_epoch = int(spe_cfg)
     else:
+        max_train_steps_cfg = config["trainer"].get("scheduler_max_steps")
         train_dataloader = data_module.train_dataloader()
         try:
             steps_per_epoch = len(train_dataloader)
         except TypeError as e:
-            raise TypeError(
-                "train_dataloader has no len(); set trainer.steps_per_epoch in config."
-            ) from e
+            if max_train_steps_cfg is not None:
+                steps_per_epoch = max(
+                    1, int(math.ceil(int(max_train_steps_cfg) / max_epochs))
+                )
+            else:
+                raise TypeError(
+                    "train_dataloader has no len(); set trainer.steps_per_epoch "
+                    "or trainer.scheduler_max_steps in config."
+                ) from e
 
     max_train_steps_cfg = config["trainer"].get("scheduler_max_steps")
     max_train_steps = (
@@ -1497,13 +1505,19 @@ def main(device):
                 if spe_cfg is not None:
                     steps_per_epoch = int(spe_cfg)
                 else:
+                    max_train_steps_cfg = conf["trainer"].get("scheduler_max_steps")
                     try:
                         steps_per_epoch = len(train_dataloader)
                     except TypeError as e:
-                        raise TypeError(
-                            "train_dataloader has no len(); set trainer.steps_per_epoch "
-                            "in the config for step-based LR scheduling."
-                        ) from e
+                        if max_train_steps_cfg is not None:
+                            steps_per_epoch = max(
+                                1, int(math.ceil(int(max_train_steps_cfg) / max_epochs))
+                            )
+                        else:
+                            raise TypeError(
+                                "train_dataloader has no len(); set trainer.steps_per_epoch "
+                                "or trainer.scheduler_max_steps in the config for step-based LR scheduling."
+                            ) from e
 
                 max_train_steps_cfg = conf["trainer"].get("scheduler_max_steps")
                 if max_train_steps_cfg is not None:
