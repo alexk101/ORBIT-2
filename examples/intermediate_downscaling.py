@@ -34,7 +34,7 @@ from climate_learn.models.hub.components.cnn_blocks import (
     UpBlock,
     ResidualBlock,
 )
-from climate_learn.utils.fused_attn import FusedAttn
+from climate_learn.utils.fused_attn import FusedAttn, parse_fused_attn
 from climate_learn.models.hub.components.pos_embed import interpolate_pos_embed
 from utils import seed_everything, init_par_groups
 
@@ -986,13 +986,19 @@ def main(device):
         num_heads=num_heads,
     )
 
-    if gpu_type == "amd":
+    fused_attn_cfg = conf["model"].get("fused_attn")
+    if fused_attn_cfg is not None:
+        FusedAttn_option = parse_fused_attn(str(fused_attn_cfg))
+    elif gpu_type == "amd":
         if data_type == "bfloat16":
             FusedAttn_option = FusedAttn.CK
         else:
             FusedAttn_option = FusedAttn.DEFAULT
     else:
         FusedAttn_option = FusedAttn.DEFAULT
+
+    if world_rank == 0:
+        print(f"Fused attention backend: {FusedAttn_option}", flush=True)
 
     model_kwargs = {
         "default_vars": default_vars,

@@ -26,7 +26,7 @@ from ..metrics import MetricsMetaInfo, METRICS_REGISTRY
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import _LRScheduler as LRScheduler
-from climate_learn.utils.fused_attn import FusedAttn
+from climate_learn.utils.fused_attn import FusedAttn, parse_fused_attn
 
 
 def load_model_module(
@@ -274,8 +274,10 @@ def load_architecture(
     drop_rate=0.1, 
     tensor_par_size = 1, 
     tensor_par_group = None,
-    FusedAttn_option = FusedAttn.CK 
+    FusedAttn_option=FusedAttn.CK,
 ):
+    if isinstance(FusedAttn_option, str):
+        FusedAttn_option = parse_fused_attn(FusedAttn_option)
     in_vars, out_vars = get_data_variables(data_module)
     in_shape, out_shape = get_data_dims(data_module)
 
