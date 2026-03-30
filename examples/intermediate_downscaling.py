@@ -289,15 +289,41 @@ def clip_replace_constant(y, yhat, out_variables):
     return yhat
 
 
+def _debug_report_finite(name: str, tensor: torch.Tensor, batch_idx: int) -> None:
+    """When ORBIT_DEBUG_FINITE=1, print finite/nan/inf stats on the first batch per rank."""
+    if int(os.environ.get("ORBIT_DEBUG_FINITE", "0")) != 1 or batch_idx != 0:
+        return
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    t = tensor.detach()
+    finite = torch.isfinite(t)
+    if finite.all():
+        print(
+            f"[ORBIT_DEBUG_FINITE] rank={rank} {name}: all finite "
+            f"min={t.min().item():.6g} max={t.max().item():.6g}",
+            flush=True,
+        )
+    else:
+        n_nan = torch.isnan(t).sum().item()
+        n_inf = torch.isinf(t).sum().item()
+        print(
+            f"[ORBIT_DEBUG_FINITE] rank={rank} {name}: NOT FINITE "
+            f"nan={n_nan} inf={n_inf} shape={tuple(t.shape)}",
+            flush=True,
+        )
+
+
 def training_step(
     batch, batch_idx, net, device: int, var_weights, train_loss_metric
 ) -> torch.Tensor:
     x, y, in_variables, out_variables = batch
     x = x.to(device)
     y = y.to(device)
+    _debug_report_finite("batch[x]", x, batch_idx)
+    _debug_report_finite("batch[y]", y, batch_idx)
 
     yhat = net.forward(x, in_variables, out_variables)
     yhat = clip_replace_constant(y, yhat, out_variables)
+    _debug_report_finite("yhat", yhat, batch_idx)
 
     if y.size(dim=2) != yhat.size(dim=2) or y.size(dim=3) != yhat.size(dim=3):
         losses = train_loss_metric(
@@ -316,6 +342,8 @@ def training_step(
         loss = losses
     else:  # per channel + aggregate
         loss = losses[-1]
+
+    _debug_report_finite("loss", loss.unsqueeze(0) if loss.dim() == 0 else loss, batch_idx)
 
     return loss
 
