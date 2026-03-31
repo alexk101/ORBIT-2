@@ -65,9 +65,14 @@ def get_tensor_parallel_checkpoint_path(base_path, rank, tensor_par_size):
     return base_path
 
 
-def get_checkpoint_filename(save_path, epoch, world_rank, tensor_par_size):
+def get_checkpoint_filename(
+    save_path, epoch, world_rank, tensor_par_size, global_step=None
+):
     """Generate checkpoint filename for given epoch and rank."""
-    base_filename = f"{save_path}/interm_epoch_{epoch}.ckpt"
+    if global_step is None:
+        base_filename = f"{save_path}/interm_epoch_{epoch}.ckpt"
+    else:
+        base_filename = f"{save_path}/interm_epoch_{epoch}_step_{global_step}.ckpt"
     if tensor_par_size > 1:
         return f"{base_filename}_rank_{world_rank}"
     return base_filename
@@ -771,6 +776,7 @@ def run_training_epochs(
     log_every_n_steps,
     wandb_run,
     data_key,
+    start_batch_idx: int = 0,
     interval_val_max_batches: Optional[int] = None,
     log_weight_norm: bool = True,
 ):
@@ -793,6 +799,8 @@ def run_training_epochs(
         min_scale (float): Minimum scale value for GradScaler (None for float32)
         cp_save_path (str): Path for saving checkpoints
         local_rank (int): Local rank for current process
+        start_batch_idx (int): Number of leading batches to skip on the first
+            resumed epoch when loading a step checkpoint.
         interval_val_max_batches: Max val batches per rank when logging interval metrics (None = all).
         log_weight_norm: If False, skip weight L2 (avoids FSDP full-param materialization).
 
@@ -806,6 +814,8 @@ def run_training_epochs(
         dist_print(f"Starting epoch {epoch}")
 
         for batch_idx, batch in enumerate(train_dataloader):
+            if batch_idx < start_batch_idx:
+                continue
             if world_rank == 0:
                 torch.cuda.synchronize(device=device)
                 tic1 = time.perf_counter()
@@ -914,7 +924,23 @@ def run_training_epochs(
                         },
                         train_monitor["global_step"],
                     )
-                dist.barrier(device_ids=[local_rank])
+
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    cp_save_path,
+                    world_rank,
+                    local_rank,
+                    tensor_par_size,
+                    device,
+                    global_step=train_monitor["global_step"],
+                    save_by_step=True,
+                    data_key=data_key,
+                    batch_in_epoch=batch_idx + 1,
+                    is_step_checkpoint=True,
+                )
 
         dist_print(f"Epoch {epoch} completed. Loss: {epoch_loss.item()}")
 
@@ -929,7 +955,10 @@ def run_training_epochs(
             tensor_par_size,
             device,
             global_step=train_monitor["global_step"],
+            data_key=data_key,
         )
+        # Apply resume skip only once (first resumed epoch).
+        start_batch_idx = 0
 
     return epoch_end
 
@@ -945,6 +974,10 @@ def save_checkpoint(
     tensor_par_size,
     device,
     global_step=0,
+    save_by_step=False,
+    data_key=None,
+    batch_in_epoch=None,
+    is_step_checkpoint=False,
 ):
     """
     Save model checkpoint to disk.
@@ -977,12 +1010,19 @@ def save_checkpoint(
     # Save checkpoint only for ranks that are part of tensor parallelism
     if world_rank < tensor_par_size:
         file_name = get_checkpoint_filename(
-            cp_save_path, epoch, world_rank, tensor_par_size
+            cp_save_path,
+            epoch,
+            world_rank,
+            tensor_par_size,
+            global_step=global_step if save_by_step else None,
         )
 
         checkpoint_dict = {
             "epoch": epoch,
             "global_step": global_step,
+            "data_key": data_key,
+            "batch_in_epoch": batch_in_epoch,
+            "is_step_checkpoint": bool(is_step_checkpoint),
             "model_state_dict": model_states,
             "optimizer_state_dict": optimizer_states,
             "scheduler_state_dict": scheduler_states,
@@ -1270,6 +1310,8 @@ def main(device):
     }
 
     resume_scheduler_state_dict = None
+    resume_data_key = None
+    resume_batch_in_epoch = 0
 
     wandb_conf = conf["trainer"].get("wandb") or {}
     wandb_enabled = bool(wandb_conf.get("enabled", False))
@@ -1324,6 +1366,8 @@ def main(device):
     while (epoch_start + interval_epochs) < max_epochs:
 
         for data_key in low_res_dir.keys():
+            if resume_data_key is not None and data_key != resume_data_key:
+                continue
             # Set up data
 
             in_vars = dict_in_variables[data_key]
@@ -1534,10 +1578,19 @@ def main(device):
 
                     checkpoint = torch.load(checkpoint_path, map_location=map_location)
                     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                    epoch_start = checkpoint["epoch"] + 1
+                    is_step_checkpoint = bool(
+                        checkpoint.get("is_step_checkpoint", False)
+                    )
+                    epoch_start = (
+                        int(checkpoint["epoch"])
+                        if is_step_checkpoint
+                        else int(checkpoint["epoch"]) + 1
+                    )
                     train_monitor["global_step"] = int(
                         checkpoint.get("global_step", 0)
                     )
+                    resume_data_key = checkpoint.get("data_key")
+                    resume_batch_in_epoch = int(checkpoint.get("batch_in_epoch", 0) or 0)
                     train_monitor["interval_loss_sum"] = 0.0
                     train_monitor["interval_steps"] = 0
                     resume_scheduler_state_dict = checkpoint["scheduler_state_dict"]
@@ -1684,9 +1737,12 @@ def main(device):
                 log_every_n_steps=log_every_n_steps,
                 wandb_run=wandb_run,
                 data_key=data_key,
+                start_batch_idx=resume_batch_in_epoch,
                 interval_val_max_batches=interval_val_max_batches,
                 log_weight_norm=log_weight_norm,
             )
+            resume_data_key = None
+            resume_batch_in_epoch = 0
 
             if first_time_bool:
                 first_time_bool = False
